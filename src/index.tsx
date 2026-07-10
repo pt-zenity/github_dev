@@ -2110,63 +2110,125 @@ function runDetailPage(user: any, owner: string, repo: string, run: any, jobsDat
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
 
+    // ── Log parsing helpers ──────────────────────────────────────────────────
+    // Parse a raw GitHub Actions log line into its parts
+    function parseLogLine(rawLine) {
+      // GitHub Actions format: "2026-07-10T23:27:49.9596266Z ##[group]Run ..."
+      // The timestamp may have 7-digit subseconds (Windows precision)
+      const tsRx = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z ?(.*)/;
+      const m = rawLine.match(tsRx);
+      if (m) {
+        return { isoTs: m[1], timeStr: m[1].substring(11, 19), content: m[2] };
+      }
+      return { isoTs: '', timeStr: '', content: rawLine };
+    }
+
+    // Classify a stripped content line → CSS class + icon prefix
+    function classifyLine(content) {
+      const c = content;
+      const cl = c.toLowerCase();
+      // GitHub workflow commands
+      if (/^##\[error\]/i.test(c))   return { cls: 'log-error',   icon: '✖', cmd: true };
+      if (/^##\[warning\]/i.test(c)) return { cls: 'log-warn',    icon: '⚠', cmd: true };
+      if (/^##\[group\]/i.test(c))   return { cls: 'log-group',   icon: '▶', cmd: true };
+      if (/^##\[endgroup\]/i.test(c))return { cls: 'log-endgroup',icon: '◀', cmd: true };
+      if (/^##\[section\]/i.test(c)) return { cls: 'log-section', icon: '§', cmd: true };
+      if (/^##\[debug\]/i.test(c))   return { cls: 'log-debug',   icon: '·', cmd: true };
+      if (/^##\[command\]/i.test(c)) return { cls: 'log-command', icon: '$', cmd: true };
+      if (/^##\[notice\]/i.test(c))  return { cls: 'log-notice',  icon: 'ℹ', cmd: true };
+      // Content-based classification (applied only when no workflow command matched)
+      if (/error[:( ]|error$/i.test(cl) || /\bfailed?\b/i.test(cl) || /BUILD FAILURE/.test(c)) return { cls: 'log-error', icon: '', cmd: false };
+      if (/warning[:( ]|warning$/i.test(cl) || /\bwarn\b/i.test(cl))                           return { cls: 'log-warn',  icon: '', cmd: false };
+      if (/\bsuccess(fully)?\b|\bpassed\b|\bdone\b/i.test(cl))                                 return { cls: 'log-success',icon:'', cmd: false };
+      // "with:" / "env:" key-value indented blocks (lines that start with spaces + "key: value")
+      if (/^\s{2,}\S/.test(c) && /:\s/.test(c))                                                return { cls: 'log-kv',    icon: '', cmd: false };
+      return { cls: 'log-normal', icon: '', cmd: false };
+    }
+
+    // Strip ##[cmd] prefix and return clean display text + indent level
+    function formatContent(content, isCmd) {
+      if (!isCmd) return { text: content, indent: 0 };
+      // e.g. "##[group]Run mr-smithers…"  →  "Run mr-smithers…"
+      const stripped = content.replace(/^##\[[^\]]+\]\s?/, '');
+      return { text: stripped, indent: 0 };
+    }
+
     function renderLog(lines) {
       const out = document.getElementById('logOutput');
       out.innerHTML = '';
       const frag = document.createDocumentFragment();
 
+      // Track indent depth for group nesting
+      let depth = 0;
+
       lines.forEach((rawLine, i) => {
-        // Strip GitHub's timestamp prefix: "2024-01-01T00:00:00.0000000Z "
-        const tsMatch = rawLine.match(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?(.*)$/);
-        const ts = tsMatch ? rawLine.substring(0, rawLine.indexOf(' ')) : '';
-        const line = tsMatch ? tsMatch[1] : rawLine;
+        if (rawLine === '') {
+          // Preserve blank separator lines
+          const blank = document.createElement('div');
+          blank.className = 'log-line log-blank';
+          blank.innerHTML = '<span class="log-linenum">' + String(i + 1).padStart(5) + '</span>';
+          frag.appendChild(blank);
+          return;
+        }
+
+        const { isoTs, timeStr, content } = parseLogLine(rawLine);
+        const { cls, icon, cmd } = classifyLine(content);
+        const { text } = formatContent(content, cmd);
+
+        // Manage group depth BEFORE rendering so endgroup de-indents this line
+        if (/^##\[endgroup\]/i.test(content)) depth = Math.max(0, depth - 1);
 
         const el = document.createElement('div');
-        el.className = 'log-line';
+        el.className = 'log-line ' + cls;
+        if (depth > 0) el.style.paddingLeft = (12 + depth * 14) + 'px';
         el.id = 'logline-' + i;
 
-        // Colorize by content
-        const l = line.toLowerCase();
-        if (line.includes('##[error]') || /\berror\b/.test(l) || line.includes('FAILED') || line.includes('BUILD FAILURE')) {
-          el.classList.add('log-error');
-        } else if (line.includes('##[warning]') || /\bwarning\b/.test(l) || line.includes('WARN')) {
-          el.classList.add('log-warn');
-        } else if (line.includes('##[group]') || line.includes('##[endgroup]')) {
-          el.classList.add('log-group');
-        } else if (line.includes('##[section]') || /^(Run|Build|Test|Deploy|Install|Step|Job)/.test(line)) {
-          el.classList.add('log-section');
-        } else if (/successfully|passed|success|done/i.test(l)) {
-          el.classList.add('log-success');
-        } else if (ts) {
-          el.classList.add('log-normal');
+        // ① Line number
+        const numEl = document.createElement('span');
+        numEl.className = 'log-linenum';
+        numEl.textContent = String(i + 1).padStart(5);
+        el.appendChild(numEl);
+
+        // ② Timestamp  HH:MM:SS  (compact, dimmed)
+        const tsEl = document.createElement('span');
+        tsEl.className = 'log-ts';
+        tsEl.textContent = timeStr ? timeStr + ' ' : '         ';
+        el.appendChild(tsEl);
+
+        // ③ Icon badge for workflow commands
+        if (icon) {
+          const iconEl = document.createElement('span');
+          iconEl.className = 'log-icon';
+          iconEl.textContent = icon + ' ';
+          el.appendChild(iconEl);
         }
 
-        // Line number
-        const lineNum = document.createElement('span');
-        lineNum.className = 'log-linenum';
-        lineNum.textContent = String(i + 1).padStart(5, ' ');
-        el.appendChild(lineNum);
-
-        // Timestamp (dimmed)
-        if (ts) {
-          const tsEl = document.createElement('span');
-          tsEl.className = 'log-ts';
-          tsEl.textContent = ts.substring(11, 19) + ' '; // show only HH:MM:SS
-          el.appendChild(tsEl);
+        // ④ Main content — detect "key: value" pairs inside indented kv blocks
+        const contentEl = document.createElement('span');
+        contentEl.className = 'log-content';
+        if (cls === 'log-kv') {
+          // Syntax-highlight key: value
+          const kvMatch = text.match(/^(\s*)(\S[^:]*)(:\s?)(.*)$/);
+          if (kvMatch) {
+            contentEl.innerHTML =
+              escHtml(kvMatch[1]) +
+              '<span class="log-kv-key">' + escHtml(kvMatch[2]) + '</span>' +
+              '<span class="log-kv-sep">' + escHtml(kvMatch[3]) + '</span>' +
+              '<span class="log-kv-val">' + escHtml(kvMatch[4]) + '</span>';
+          } else {
+            contentEl.textContent = text;
+          }
+        } else {
+          contentEl.textContent = text;
         }
+        el.appendChild(contentEl);
 
-        // Content
-        const txt = document.createElement('span');
-        // Strip ##[group], ##[error] markers for cleaner display
-        txt.textContent = line
-          .replace(/##\[group\]/g, '▶ ')
-          .replace(/##\[endgroup\]/g, '◀ ')
-          .replace(/##\[error\]/g, '✗ ')
-          .replace(/##\[warning\]/g, '⚠ ')
-          .replace(/##\[section\]/g, '§ ');
-        el.appendChild(txt);
         frag.appendChild(el);
+
+        // Increment depth AFTER rendering the group header line
+        if (/^##\[group\]/i.test(content)) depth++;
       });
+
       out.appendChild(frag);
     }
 
