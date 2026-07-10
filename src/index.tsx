@@ -310,22 +310,147 @@ app.get('/repo/:owner/:repo/pulls/:number', async (c) => {
   return c.html(prDetailPage(user, owner, repo, prRes.data, commentsRes.data, repoRes.data, filesRes.data))
 })
 
-// Actions
+// Actions - main page (with workflow filter)
 app.get('/repo/:owner/:repo/actions', async (c) => {
   const token = getToken(c)
   if (!token) return c.redirect('/login')
   const { owner, repo } = c.req.param()
   const page = parseInt(c.req.query('page') || '1')
+  const wfId = c.req.query('workflow') || ''
+  const statusFilter = c.req.query('status') || ''
   const userCookie = getCookie(c, 'gh_user')
   const user = userCookie ? JSON.parse(userCookie) : {}
-  
+
+  let runsUrl = `/repos/${owner}/${repo}/actions/runs?per_page=20&page=${page}`
+  if (wfId) runsUrl += `&workflow_id=${encodeURIComponent(wfId)}`
+  if (statusFilter) runsUrl += `&status=${encodeURIComponent(statusFilter)}`
+
   const [runsRes, workflowsRes, repoRes] = await Promise.all([
-    githubApi(token, `/repos/${owner}/${repo}/actions/runs?per_page=20&page=${page}`),
-    githubApi(token, `/repos/${owner}/${repo}/actions/workflows`),
+    githubApi(token, runsUrl),
+    githubApi(token, `/repos/${owner}/${repo}/actions/workflows?per_page=50`),
     githubApi(token, `/repos/${owner}/${repo}`)
   ])
-  
-  return c.html(actionsPage(user, owner, repo, runsRes.data, workflowsRes.data, repoRes.data, page))
+
+  return c.html(actionsPage(user, owner, repo, runsRes.data, workflowsRes.data, repoRes.data, page, wfId, statusFilter))
+})
+
+// Run detail page (jobs + steps)
+app.get('/repo/:owner/:repo/actions/runs/:runId', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.redirect('/login')
+  const { owner, repo, runId } = c.req.param()
+  const userCookie = getCookie(c, 'gh_user')
+  const user = userCookie ? JSON.parse(userCookie) : {}
+
+  const [runRes, jobsRes, repoRes] = await Promise.all([
+    githubApi(token, `/repos/${owner}/${repo}/actions/runs/${runId}`),
+    githubApi(token, `/repos/${owner}/${repo}/actions/runs/${runId}/jobs?per_page=30`),
+    githubApi(token, `/repos/${owner}/${repo}`)
+  ])
+
+  return c.html(runDetailPage(user, owner, repo, runRes.data, jobsRes.data, repoRes.data))
+})
+
+// API: Get run status (for polling)
+app.get('/repo/:owner/:repo/actions/runs/:runId/status', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, runId } = c.req.param()
+  const [runRes, jobsRes] = await Promise.all([
+    githubApi(token, `/repos/${owner}/${repo}/actions/runs/${runId}`),
+    githubApi(token, `/repos/${owner}/${repo}/actions/runs/${runId}/jobs?per_page=30`)
+  ])
+  return c.json({ run: runRes.data, jobs: jobsRes.data })
+})
+
+// API: Get job log
+app.get('/repo/:owner/:repo/actions/jobs/:jobId/logs', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, jobId } = c.req.param()
+  // GitHub returns redirect to actual log URL
+  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/jobs/${jobId}/logs`, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'GitManager/1.0'
+    },
+    redirect: 'follow'
+  })
+  if (!resp.ok) return c.json({ error: 'Cannot fetch logs', status: resp.status }, 400)
+  const logText = await resp.text()
+  return c.text(logText)
+})
+
+// API: Trigger workflow dispatch
+app.post('/repo/:owner/:repo/actions/workflows/:workflowId/dispatch', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, workflowId } = c.req.param()
+  const body = await c.req.json() as any
+  const ref = body.ref || 'main'
+  const inputs = body.inputs || {}
+
+  const res = await githubApi(token, `/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(workflowId)}/dispatches`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ref, inputs })
+  })
+  if (res.status === 204) return c.json({ success: true })
+  return c.json({ error: 'Dispatch failed', detail: res.data, status: res.status }, 400)
+})
+
+// API: Cancel a run
+app.post('/repo/:owner/:repo/actions/runs/:runId/cancel', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, runId } = c.req.param()
+  const res = await githubApi(token, `/repos/${owner}/${repo}/actions/runs/${runId}/cancel`, { method: 'POST' })
+  if (res.status === 202) return c.json({ success: true })
+  return c.json({ error: 'Cancel failed', detail: res.data }, 400)
+})
+
+// API: Re-run a workflow
+app.post('/repo/:owner/:repo/actions/runs/:runId/rerun', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, runId } = c.req.param()
+  const res = await githubApi(token, `/repos/${owner}/${repo}/actions/runs/${runId}/rerun`, { method: 'POST' })
+  if (res.status === 201) return c.json({ success: true })
+  return c.json({ error: 'Re-run failed', detail: res.data }, 400)
+})
+
+// API: Re-run failed jobs only
+app.post('/repo/:owner/:repo/actions/runs/:runId/rerun-failed', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, runId } = c.req.param()
+  const res = await githubApi(token, `/repos/${owner}/${repo}/actions/runs/${runId}/rerun-failed-jobs`, { method: 'POST' })
+  if (res.status === 201) return c.json({ success: true })
+  return c.json({ error: 'Re-run failed jobs error', detail: res.data }, 400)
+})
+
+// API: Delete a run
+app.delete('/repo/:owner/:repo/actions/runs/:runId', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, runId } = c.req.param()
+  const res = await githubApi(token, `/repos/${owner}/${repo}/actions/runs/${runId}`, { method: 'DELETE' })
+  if (res.status === 204) return c.json({ success: true })
+  return c.json({ error: 'Delete failed', detail: res.data }, 400)
+})
+
+// API: Get latest runs (for live polling on main page)
+app.get('/repo/:owner/:repo/actions/poll', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo } = c.req.param()
+  const wfId = c.req.query('workflow') || ''
+  let url = `/repos/${owner}/${repo}/actions/runs?per_page=20&page=1`
+  if (wfId) url += `&workflow_id=${encodeURIComponent(wfId)}`
+  const res = await githubApi(token, url)
+  return c.json(res.data)
 })
 
 // Releases
@@ -1258,70 +1383,759 @@ function prDetailPage(user: any, owner: string, repo: string, pr: any, comments:
   return glassLayout(`PR #${pr?.number} - ${repo}`, user, content)
 }
 
-function actionsPage(user: any, owner: string, repo: string, runs: any, workflows: any, repoData: any, page: number) {
+function actionsPage(user: any, owner: string, repo: string, runs: any, workflows: any, repoData: any, page: number, wfFilter: string, statusFilter: string) {
   const runItems = runs?.workflow_runs || []
   const workflowItems = workflows?.workflows || []
+  const totalRuns = runs?.total_count || 0
 
-  const statusIcon = (s: string, c: string) => {
-    if (s === 'completed') {
-      if (c === 'success') return '✅'
-      if (c === 'failure') return '❌'
-      if (c === 'cancelled') return '⛔'
-      return '⚪'
+  const statusBadge = (status: string, conclusion: string) => {
+    if (status === 'completed') {
+      if (conclusion === 'success') return '<span class="run-badge run-success">✓ success</span>'
+      if (conclusion === 'failure') return '<span class="run-badge run-failure">✗ failure</span>'
+      if (conclusion === 'cancelled') return '<span class="run-badge run-cancelled">⊘ cancelled</span>'
+      if (conclusion === 'skipped') return '<span class="run-badge run-skipped">⊝ skipped</span>'
+      if (conclusion === 'timed_out') return '<span class="run-badge run-failure">⏱ timed out</span>'
+      return `<span class="run-badge run-neutral">${conclusion || 'completed'}</span>`
     }
-    if (s === 'in_progress') return '🔄'
-    if (s === 'queued') return '⏳'
-    return '⚪'
+    if (status === 'in_progress') return '<span class="run-badge run-running"><span class="pulse-dot"></span>in progress</span>'
+    if (status === 'queued') return '<span class="run-badge run-queued">⏳ queued</span>'
+    if (status === 'waiting') return '<span class="run-badge run-queued">⏸ waiting</span>'
+    return `<span class="run-badge run-neutral">${status}</span>`
   }
+
+  const statusIcon = (status: string, conclusion: string) => {
+    if (status === 'in_progress') return '<div class="run-icon-spin">◌</div>'
+    if (status === 'queued' || status === 'waiting') return '<div class="run-icon" style="color:#f59e0b">◎</div>'
+    if (status === 'completed') {
+      if (conclusion === 'success') return '<div class="run-icon" style="color:#22c55e">●</div>'
+      if (conclusion === 'failure') return '<div class="run-icon" style="color:#ef4444">●</div>'
+      if (conclusion === 'cancelled') return '<div class="run-icon" style="color:#6b7280">●</div>'
+      return '<div class="run-icon" style="color:#6b7280">●</div>'
+    }
+    return '<div class="run-icon" style="color:#6b7280">○</div>'
+  }
+
+  const durationMs = (run: any) => {
+    if (!run.run_started_at) return ''
+    const start = new Date(run.run_started_at).getTime()
+    const end = run.updated_at ? new Date(run.updated_at).getTime() : Date.now()
+    const s = Math.floor((end - start) / 1000)
+    if (s < 60) return `${s}s`
+    return `${Math.floor(s/60)}m ${s%60}s`
+  }
+
+  const statusFilters = ['', 'success', 'failure', 'cancelled', 'in_progress', 'queued']
 
   const content = `
     ${repoNav(owner, repo, 'actions', repoData)}
-    ${workflowItems.length > 0 ? `
-      <div class="glass-card mb-4">
-        <div class="p-4">
-          <h3 class="text-sm font-semibold text-white/60 mb-3 uppercase tracking-wider">Workflows</h3>
-          <div class="flex flex-wrap gap-2">
-            ${workflowItems.map((w: any) => `
-              <span class="glass-btn-sm ${w.state === 'active' ? 'text-green-300' : 'text-white/40'}">${w.name}</span>
-            `).join('')}
-          </div>
+    <div id="actions-toast" class="toast hidden"></div>
+
+    <!-- Workflows Panel -->
+    <div class="glass-card mb-4" id="workflowsPanel">
+      <div class="wf-panel-header" onclick="togglePanel('workflowsPanel')">
+        <div class="flex items-center gap-2">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          <span class="font-semibold text-white">Workflows</span>
+          <span class="count-badge">${workflowItems.length}</span>
         </div>
+        <svg class="wf-chevron" id="workflowsPanel-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
       </div>
-    ` : ''}
-    <div class="section-header">
-      <h3 class="section-title">Workflow Runs</h3>
-      <div class="flex gap-2">
-        ${page > 1 ? `<a href="?page=${page - 1}" class="glass-btn-sm">← Prev</a>` : ''}
-        ${runItems.length === 20 ? `<a href="?page=${page + 1}" class="glass-btn-sm">Next →</a>` : ''}
-      </div>
-    </div>
-    ${runItems.length === 0 ? '<div class="empty-state">Tidak ada workflow runs</div>' : `
-      <div class="space-y-2">
-        ${runItems.map((run: any) => `
-          <div class="glass-card hover-lift">
-            <div class="p-4">
-              <div class="flex items-center gap-3">
-                <span class="text-xl">${statusIcon(run.status, run.conclusion)}</span>
-                <div class="flex-1">
-                  <div class="text-white font-medium">${escapeHtml(run.display_title || run.name)}</div>
-                  <div class="flex gap-3 mt-1 text-sm text-white/50">
-                    <span>${run.name}</span>
-                    <span>${run.head_branch}</span>
-                    <span>${timeAgo(run.created_at)}</span>
-                    <code class="text-xs">${run.head_sha?.substring(0, 7)}</code>
+      <div class="wf-panel-body" id="workflowsPanel-body">
+        ${workflowItems.length === 0 ? '<div class="p-4 text-white/40 text-sm">No workflows found</div>' : `
+          <div class="wf-list">
+            ${workflowItems.map((w: any) => `
+              <div class="wf-item ${wfFilter === String(w.id) ? 'active' : ''}">
+                <div class="wf-item-left">
+                  <div class="wf-state-dot ${w.state === 'active' ? 'active' : 'inactive'}"></div>
+                  <div>
+                    <div class="wf-name">${escapeHtml(w.name)}</div>
+                    <div class="wf-path">${escapeHtml(w.path)}</div>
                   </div>
                 </div>
-                <div class="text-right">
-                  <span class="badge-${run.conclusion === 'success' ? 'public' : run.conclusion === 'failure' ? 'private' : 'neutral'}">${run.status} ${run.conclusion ? '· ' + run.conclusion : ''}</span>
+                <div class="wf-item-actions">
+                  <a href="/repo/${owner}/${repo}/actions?workflow=${w.id}" class="glass-btn-sm ${wfFilter === String(w.id) ? 'active' : ''}">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                    Filter
+                  </a>
+                  <button class="glass-btn-sm text-green-300" onclick="openDispatch('${w.id}','${escapeHtml(w.name)}')">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    Run
+                  </button>
                 </div>
               </div>
-            </div>
+            `).join('')}
           </div>
-        `).join('')}
+        `}
       </div>
-    `}
+    </div>
+
+    <!-- Runs Header -->
+    <div class="section-header mb-3">
+      <div class="flex items-center gap-3 flex-wrap">
+        <h3 class="section-title">
+          Workflow Runs
+          ${wfFilter ? `<span class="text-white/40 text-sm font-normal"> — ${escapeHtml(workflowItems.find((w: any) => String(w.id) === wfFilter)?.name || wfFilter)}</span>` : ''}
+        </h3>
+        <span class="text-white/30 text-sm">${totalRuns.toLocaleString()} total</span>
+      </div>
+      <div class="flex items-center gap-2 flex-wrap">
+        <!-- Status filter pills -->
+        <div class="flex gap-1 flex-wrap">
+          ${statusFilters.map(s => `
+            <a href="/repo/${owner}/${repo}/actions?${wfFilter ? 'workflow=' + wfFilter + '&' : ''}${s ? 'status=' + s : ''}"
+               class="filter-pill ${statusFilter === s ? 'active' : ''}">
+              ${s || 'All'}
+            </a>
+          `).join('')}
+        </div>
+        ${wfFilter ? `<a href="/repo/${owner}/${repo}/actions" class="glass-btn-sm text-red-300">✕ Clear filter</a>` : ''}
+        <button class="glass-btn-sm" id="liveToggle" onclick="toggleLive()" title="Toggle auto-refresh">
+          <span class="pulse-dot" id="liveDot" style="display:none"></span>
+          <span id="liveLabel">⟳ Live</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Runs List -->
+    <div id="runsList">
+      ${runItems.length === 0 ? '<div class="empty-state">Tidak ada workflow runs</div>' : `
+        <div class="runs-container">
+          ${runItems.map((run: any) => renderRunCard(run, owner, repo, statusBadge, statusIcon, durationMs)).join('')}
+        </div>
+      `}
+    </div>
+
+    <!-- Pagination -->
+    <div class="flex gap-2 mt-4 justify-between items-center">
+      <div class="text-white/40 text-sm">Page ${page}</div>
+      <div class="flex gap-2">
+        ${page > 1 ? `<a href="?${wfFilter ? 'workflow=' + wfFilter + '&' : ''}${statusFilter ? 'status=' + statusFilter + '&' : ''}page=${page - 1}" class="glass-btn-sm">← Prev</a>` : ''}
+        ${runItems.length === 20 ? `<a href="?${wfFilter ? 'workflow=' + wfFilter + '&' : ''}${statusFilter ? 'status=' + statusFilter + '&' : ''}page=${page + 1}" class="glass-btn-sm">Next →</a>` : ''}
+      </div>
+    </div>
+
+    <!-- Dispatch Modal -->
+    <div id="dispatchBackdrop" class="modal-backdrop hidden" onclick="closeDispatch()"></div>
+    <div id="dispatchModal" class="secret-modal hidden" style="max-width:480px">
+      <div class="modal-header">
+        <h3 class="modal-title">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:inline;vertical-align:-2px"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          Run Workflow: <span id="dispatchName" class="text-green-300"></span>
+        </h3>
+        <button class="modal-close" onclick="closeDispatch()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label">Branch / Tag</label>
+          <input type="text" id="dispatchRef" class="form-input font-mono" value="${repoData?.default_branch || 'main'}" placeholder="main" />
+          <div class="text-white/30 text-xs mt-1">Branch atau tag yang akan dijalankan workflow-nya</div>
+        </div>
+        <div class="form-group" id="dispatchInputsGroup" style="display:none">
+          <label class="form-label">Inputs (JSON)</label>
+          <textarea id="dispatchInputs" class="form-input font-mono" rows="3" placeholder='{"key": "value"}'></textarea>
+          <div class="text-white/30 text-xs mt-1">Opsional: workflow_dispatch inputs dalam format JSON</div>
+        </div>
+        <div id="dispatchError" class="alert-error hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="glass-btn-sm" onclick="closeDispatch()">Batal</button>
+        <button class="btn-primary" id="dispatchBtn" onclick="triggerDispatch()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          Jalankan
+        </button>
+      </div>
+    </div>
+
+    <script>
+    const OWNER='${owner}', REPO='${repo}';
+    let currentDispatchId='', liveInterval=null;
+
+    function showToast(msg, type='success') {
+      const t=document.getElementById('actions-toast');
+      t.textContent=msg; t.className='toast '+(type==='success'?'toast-success':'toast-error');
+      t.classList.remove('hidden'); setTimeout(()=>t.classList.add('hidden'),4000);
+    }
+
+    // ── Workflows panel toggle ──
+    function togglePanel(id) {
+      const body=document.getElementById(id+'-body');
+      const chevron=document.getElementById(id+'-chevron');
+      const open=body.style.display!=='none';
+      body.style.display=open?'none':'block';
+      chevron.style.transform=open?'rotate(-90deg)':'rotate(0deg)';
+    }
+
+    // ── Dispatch ──
+    function openDispatch(id, name) {
+      currentDispatchId=id;
+      document.getElementById('dispatchName').textContent=name;
+      document.getElementById('dispatchError').classList.add('hidden');
+      document.getElementById('dispatchBackdrop').classList.remove('hidden');
+      document.getElementById('dispatchModal').classList.remove('hidden');
+      setTimeout(()=>document.getElementById('dispatchRef').focus(),50);
+    }
+    function closeDispatch() {
+      document.getElementById('dispatchBackdrop').classList.add('hidden');
+      document.getElementById('dispatchModal').classList.add('hidden');
+    }
+    async function triggerDispatch() {
+      const ref=document.getElementById('dispatchRef').value.trim();
+      const inputsRaw=document.getElementById('dispatchInputs').value.trim();
+      const errEl=document.getElementById('dispatchError');
+      errEl.classList.add('hidden');
+      if(!ref){errEl.textContent='Branch/tag tidak boleh kosong';errEl.classList.remove('hidden');return;}
+      let inputs={};
+      if(inputsRaw){try{inputs=JSON.parse(inputsRaw);}catch(e){errEl.textContent='Inputs bukan JSON valid';errEl.classList.remove('hidden');return;}}
+      const btn=document.getElementById('dispatchBtn');
+      btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Menjalankan...';
+      try {
+        const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/workflows/\${encodeURIComponent(currentDispatchId)}/dispatch\`,{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({ref,inputs})
+        });
+        const data=await res.json();
+        if(data.success){
+          closeDispatch();
+          showToast('Workflow berhasil di-trigger! Tunggu beberapa detik lalu refresh.');
+          setTimeout(()=>location.reload(),3000);
+        } else {
+          const msg = data.detail?.message || data.error || 'Unknown error';
+          errEl.textContent='Error: '+msg; errEl.classList.remove('hidden');
+        }
+      } catch(e){errEl.textContent='Network error: '+e.message;errEl.classList.remove('hidden');}
+      finally{btn.disabled=false;btn.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Jalankan';}
+    }
+
+    // ── Run actions ──
+    async function cancelRun(id) {
+      if(!confirm('Cancel run #'+id+'?')) return;
+      const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/runs/\${id}/cancel\`,{method:'POST'});
+      const d=await res.json();
+      if(d.success){showToast('Run #'+id+' dibatalkan.');setTimeout(()=>location.reload(),1500);}
+      else showToast('Gagal cancel: '+(d.error||'unknown'),'error');
+    }
+    async function rerunWorkflow(id) {
+      const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/runs/\${id}/rerun\`,{method:'POST'});
+      const d=await res.json();
+      if(d.success){showToast('Re-run dimulai!');setTimeout(()=>location.reload(),2000);}
+      else showToast('Gagal re-run: '+(d.detail?.message||d.error||'unknown'),'error');
+    }
+    async function rerunFailed(id) {
+      const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/runs/\${id}/rerun-failed\`,{method:'POST'});
+      const d=await res.json();
+      if(d.success){showToast('Re-run failed jobs dimulai!');setTimeout(()=>location.reload(),2000);}
+      else showToast('Gagal: '+(d.detail?.message||d.error||'unknown'),'error');
+    }
+    async function deleteRun(id) {
+      if(!confirm('Hapus run #'+id+' secara permanen?')) return;
+      const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/runs/\${id}\`,{method:'DELETE'});
+      const d=await res.json();
+      if(d.success){showToast('Run #'+id+' dihapus.');const el=document.getElementById('run-'+id);if(el){el.style.opacity=0;el.style.transform='translateX(20px)';el.style.transition='all 0.3s';setTimeout(()=>el.remove(),300);}}
+      else showToast('Gagal hapus: '+(d.error||'unknown'),'error');
+    }
+
+    // ── Live polling ──
+    function toggleLive() {
+      if(liveInterval){stopLive();}else{startLive();}
+    }
+    function startLive() {
+      liveInterval=setInterval(pollRuns,5000);
+      document.getElementById('liveDot').style.display='inline-block';
+      document.getElementById('liveLabel').textContent=' Live ON';
+      document.getElementById('liveToggle').classList.add('active');
+    }
+    function stopLive() {
+      clearInterval(liveInterval);liveInterval=null;
+      document.getElementById('liveDot').style.display='none';
+      document.getElementById('liveLabel').textContent='⟳ Live';
+      document.getElementById('liveToggle').classList.remove('active');
+    }
+    async function pollRuns() {
+      const wfId=new URLSearchParams(location.search).get('workflow')||'';
+      const url='/repo/'+OWNER+'/'+REPO+'/actions/poll'+(wfId?'?workflow='+encodeURIComponent(wfId):'');
+      try {
+        const res=await fetch(url); const data=await res.json();
+        const runs=data.workflow_runs||[];
+        // Update status badges for visible runs
+        runs.forEach(run=>{
+          const card=document.getElementById('run-'+run.id);
+          if(!card) return;
+          const badge=card.querySelector('.run-badge-wrap');
+          if(badge) badge.innerHTML=getBadgeHtml(run.status,run.conclusion);
+          const icon=card.querySelector('.run-status-icon');
+          if(icon) icon.innerHTML=getIconHtml(run.status,run.conclusion);
+          const dur=card.querySelector('.run-duration');
+          if(dur && run.run_started_at) {
+            const start=new Date(run.run_started_at).getTime();
+            const end=run.updated_at?new Date(run.updated_at).getTime():Date.now();
+            const s=Math.floor((end-start)/1000);
+            dur.textContent=s<60?s+'s':Math.floor(s/60)+'m '+(s%60)+'s';
+          }
+        });
+      } catch(e){}
+    }
+    function getBadgeHtml(status,conclusion){
+      if(status==='completed'){
+        if(conclusion==='success') return '<span class="run-badge run-success">✓ success</span>';
+        if(conclusion==='failure') return '<span class="run-badge run-failure">✗ failure</span>';
+        if(conclusion==='cancelled') return '<span class="run-badge run-cancelled">⊘ cancelled</span>';
+        return '<span class="run-badge run-neutral">'+conclusion+'</span>';
+      }
+      if(status==='in_progress') return '<span class="run-badge run-running"><span class="pulse-dot"></span>in progress</span>';
+      if(status==='queued') return '<span class="run-badge run-queued">⏳ queued</span>';
+      return '<span class="run-badge run-neutral">'+status+'</span>';
+    }
+    function getIconHtml(status,conclusion){
+      if(status==='in_progress') return '<div class="run-icon-spin">◌</div>';
+      if(status==='queued') return '<div class="run-icon" style="color:#f59e0b">◎</div>';
+      if(status==='completed'){
+        if(conclusion==='success') return '<div class="run-icon" style="color:#22c55e">●</div>';
+        if(conclusion==='failure') return '<div class="run-icon" style="color:#ef4444">●</div>';
+      }
+      return '<div class="run-icon" style="color:#6b7280">●</div>';
+    }
+
+    // Keyboard
+    document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeDispatch();}});
+
+    // Auto-start live if any run is in progress
+    const hasRunning=${runItems.some((r: any) => r.status === 'in_progress' || r.status === 'queued') ? 'true' : 'false'};
+    if(hasRunning) startLive();
+    </script>
   `
   return glassLayout(`Actions - ${repo}`, user, content)
+}
+
+function renderRunCard(run: any, owner: string, repo: string, statusBadge: Function, statusIcon: Function, durationMs: Function): string {
+  const branch = run.head_branch || ''
+  const sha = run.head_sha?.substring(0, 7) || ''
+  const dur = durationMs(run)
+  const actor = run.actor || run.triggering_actor || {}
+  const event = run.event || ''
+
+  return `
+    <div class="run-card glass-card" id="run-${run.id}" data-status="${run.status}" data-conclusion="${run.conclusion || ''}">
+      <div class="run-card-inner">
+        <!-- Status icon -->
+        <div class="run-status-icon">${statusIcon(run.status, run.conclusion)}</div>
+
+        <!-- Main info -->
+        <div class="run-main">
+          <a href="/repo/${owner}/${repo}/actions/runs/${run.id}" class="run-title">${escapeHtml(run.display_title || run.head_commit?.message?.split('\n')[0] || run.name || '')}</a>
+          <div class="run-meta">
+            <span class="run-workflow">${escapeHtml(run.name || '')}</span>
+            <span class="run-sep">·</span>
+            <span class="run-branch">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+              ${escapeHtml(branch)}
+            </span>
+            <span class="run-sep">·</span>
+            <code class="run-sha">${sha}</code>
+            <span class="run-sep">·</span>
+            <span class="run-event">${event}</span>
+            <span class="run-sep">·</span>
+            <img src="${actor.avatar_url || ''}" class="run-avatar" title="${actor.login || ''}" />
+            <span class="run-actor">${escapeHtml(actor.login || '')}</span>
+            <span class="run-sep">·</span>
+            <span class="run-time">${timeAgo(run.created_at)}</span>
+            ${dur ? `<span class="run-sep">·</span><span class="run-duration">⏱ ${dur}</span>` : ''}
+            <span class="run-sep">·</span>
+            <span class="run-number">#${run.run_number}</span>
+          </div>
+        </div>
+
+        <!-- Badge -->
+        <div class="run-badge-wrap">${statusBadge(run.status, run.conclusion)}</div>
+
+        <!-- Actions -->
+        <div class="run-actions" id="run-actions-${run.id}">
+          <a href="/repo/${owner}/${repo}/actions/runs/${run.id}" class="run-action-btn" title="View detail">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          </a>
+          ${run.status === 'in_progress' || run.status === 'queued' || run.status === 'waiting' ? `
+            <button class="run-action-btn text-red-300" onclick="cancelRun(${run.id})" title="Cancel">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+            </button>
+          ` : run.status === 'completed' ? `
+            <button class="run-action-btn text-blue-300" onclick="rerunWorkflow(${run.id})" title="Re-run all jobs">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.47"/></svg>
+            </button>
+            ${run.conclusion === 'failure' || run.conclusion === 'timed_out' ? `
+              <button class="run-action-btn text-orange-300" onclick="rerunFailed(${run.id})" title="Re-run failed jobs">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+              </button>
+            ` : ''}
+            <button class="run-action-btn text-red-300" onclick="deleteRun(${run.id})" title="Delete run">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+            </button>
+          ` : ''}
+        </div>
+      </div>
+    </div>
+  `
+}
+
+function runDetailPage(user: any, owner: string, repo: string, run: any, jobsData: any, repoData: any) {
+  const jobs = jobsData?.jobs || []
+
+  const statusIcon = (status: string, conclusion: string) => {
+    if (status === 'in_progress') return '<span class="job-icon spin" style="color:#f59e0b">◌</span>'
+    if (status === 'queued' || status === 'waiting') return '<span class="job-icon" style="color:#6b7280">◎</span>'
+    if (status === 'completed') {
+      if (conclusion === 'success') return '<span class="job-icon" style="color:#22c55e">✓</span>'
+      if (conclusion === 'failure') return '<span class="job-icon" style="color:#ef4444">✗</span>'
+      if (conclusion === 'skipped') return '<span class="job-icon" style="color:#6b7280">⊝</span>'
+      if (conclusion === 'cancelled') return '<span class="job-icon" style="color:#6b7280">⊘</span>'
+    }
+    return '<span class="job-icon" style="color:#6b7280">○</span>'
+  }
+
+  const stepIcon = (status: string, conclusion: string) => {
+    if (status === 'in_progress') return '<span class="step-icon spin" style="color:#f59e0b">◌</span>'
+    if (status === 'queued') return '<span class="step-icon" style="color:#6b7280">◎</span>'
+    if (status === 'completed') {
+      if (conclusion === 'success') return '<span class="step-icon" style="color:#22c55e">✓</span>'
+      if (conclusion === 'failure') return '<span class="step-icon" style="color:#ef4444">✗</span>'
+      if (conclusion === 'skipped') return '<span class="step-icon" style="color:#6b7280">⊝</span>'
+    }
+    return '<span class="step-icon" style="color:#6b7280">○</span>'
+  }
+
+  const runBadge = () => {
+    if (run?.status === 'in_progress') return '<span class="run-badge run-running"><span class="pulse-dot"></span>in progress</span>'
+    if (run?.status === 'queued') return '<span class="run-badge run-queued">⏳ queued</span>'
+    if (run?.conclusion === 'success') return '<span class="run-badge run-success">✓ success</span>'
+    if (run?.conclusion === 'failure') return '<span class="run-badge run-failure">✗ failure</span>'
+    if (run?.conclusion === 'cancelled') return '<span class="run-badge run-cancelled">⊘ cancelled</span>'
+    return `<span class="run-badge run-neutral">${run?.status || ''}</span>`
+  }
+
+  const dur = () => {
+    if (!run?.run_started_at) return ''
+    const s = Math.floor((new Date(run.updated_at||Date.now()).getTime() - new Date(run.run_started_at).getTime())/1000)
+    return s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`
+  }
+
+  const isActive = run?.status === 'in_progress' || run?.status === 'queued'
+
+  const content = `
+    ${repoNav(owner, repo, 'actions', repoData)}
+    <div id="detail-toast" class="toast hidden"></div>
+
+    <!-- Run Header -->
+    <div class="glass-card mb-4 run-detail-header">
+      <div class="p-5">
+        <div class="flex items-start justify-between gap-3 flex-wrap mb-3">
+          <div class="flex-1">
+            <div class="flex items-center gap-2 mb-1 flex-wrap">
+              <a href="/repo/${owner}/${repo}/actions" class="text-white/40 text-sm hover:text-white/70">← Actions</a>
+              <span class="text-white/20">/</span>
+              <span class="text-white/60 text-sm">${escapeHtml(run?.name || '')}</span>
+            </div>
+            <h2 class="text-xl font-semibold text-white" id="runTitle">${escapeHtml(run?.display_title || run?.head_commit?.message?.split('\n')[0] || '')}</h2>
+          </div>
+          <div class="flex items-center gap-2 flex-wrap" id="runBadgeWrap">
+            ${runBadge()}
+          </div>
+        </div>
+
+        <!-- Meta row -->
+        <div class="flex flex-wrap gap-4 text-sm text-white/50 mb-4">
+          <span>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:inline;vertical-align:-1px"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+            <span class="text-white/70">${escapeHtml(run?.head_branch || '')}</span>
+          </span>
+          <span>
+            <code class="text-blue-300">${run?.head_sha?.substring(0, 7)}</code>
+          </span>
+          <span>Triggered by <strong class="text-white/70">${escapeHtml(run?.actor?.login || '')}</strong></span>
+          <span>Event: <strong class="text-white/70">${run?.event || ''}</strong></span>
+          <span>Run <strong class="text-white/70">#${run?.run_number}</strong></span>
+          <span id="runDuration">${dur() ? `⏱ ${dur()}` : ''}</span>
+          <span>${timeAgo(run?.created_at)}</span>
+        </div>
+
+        <!-- Action buttons -->
+        <div class="flex gap-2 flex-wrap" id="runButtons">
+          ${isActive ? `
+            <button class="btn-danger" style="padding:7px 14px;font-size:13px" onclick="cancelRun(${run?.id})">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+              Cancel Run
+            </button>
+          ` : `
+            <button class="glass-btn-sm text-blue-300" onclick="rerunAll()">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.47"/></svg>
+              Re-run all jobs
+            </button>
+            ${run?.conclusion === 'failure' || run?.conclusion === 'timed_out' ? `
+              <button class="glass-btn-sm text-orange-300" onclick="rerunFailed()">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                Re-run failed jobs
+              </button>
+            ` : ''}
+          `}
+          ${run?.html_url ? `<a href="${run.html_url}" target="_blank" class="glass-btn-sm">View on GitHub ↗</a>` : ''}
+        </div>
+      </div>
+    </div>
+
+    <!-- Jobs + Logs layout -->
+    <div class="run-layout" id="runLayout">
+      <!-- Jobs sidebar -->
+      <div class="jobs-sidebar glass-card" id="jobsSidebar">
+        <div class="jobs-sidebar-header">
+          <span class="font-semibold text-white text-sm">Jobs</span>
+          <span class="count-badge">${jobs.length}</span>
+        </div>
+        <div class="jobs-list" id="jobsList">
+          ${jobs.map((job: any, i: number) => `
+            <button class="job-btn ${i === 0 ? 'active' : ''}" id="jobbtn-${job.id}" onclick="selectJob(${job.id}, '${escapeHtml(job.name)}')">
+              ${statusIcon(job.status, job.conclusion)}
+              <div class="job-btn-info">
+                <div class="job-btn-name">${escapeHtml(job.name)}</div>
+                <div class="job-btn-meta">
+                  ${job.runner_name ? `<span>${escapeHtml(job.runner_name)}</span>` : ''}
+                  ${job.started_at ? `<span>${timeAgo(job.started_at)}</span>` : ''}
+                </div>
+              </div>
+            </button>
+          `).join('')}
+        </div>
+      </div>
+
+      <!-- Steps + Log panel -->
+      <div class="log-panel glass-card" id="logPanel">
+        ${jobs.length === 0 ? '<div class="empty-state">No jobs found</div>' : (() => {
+          const firstJob = jobs[0]
+          return `
+            <div class="log-panel-header" id="logPanelHeader">
+              <div class="flex items-center gap-2">
+                ${statusIcon(firstJob.status, firstJob.conclusion)}
+                <span class="text-white font-medium" id="logJobName">${escapeHtml(firstJob.name)}</span>
+              </div>
+              <div class="flex gap-2">
+                <button class="glass-btn-sm" id="autoScrollBtn" onclick="toggleAutoScroll()">⬇ Auto-scroll</button>
+                <button class="glass-btn-sm" onclick="loadJobLog(${firstJob.id})" id="loadLogBtn">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                  Load Full Log
+                </button>
+              </div>
+            </div>
+
+            <!-- Steps accordion -->
+            <div class="steps-list" id="stepsList">
+              ${(firstJob.steps || []).map((step: any, si: number) => `
+                <div class="step-item ${step.conclusion === 'failure' ? 'step-failed' : ''}" id="step-${si}">
+                  <div class="step-header" onclick="toggleStep(${si})">
+                    ${stepIcon(step.status, step.conclusion)}
+                    <span class="step-name">${escapeHtml(step.name)}</span>
+                    <span class="step-num">${step.number}</span>
+                    ${step.started_at && step.completed_at ? `<span class="step-dur">⏱ ${Math.floor((new Date(step.completed_at).getTime()-new Date(step.started_at).getTime())/1000)}s</span>` : ''}
+                    <svg class="step-chevron" id="step-chevron-${si}" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                  </div>
+                  <div class="step-body hidden" id="step-body-${si}">
+                    <div class="step-log-placeholder text-white/30 text-xs p-3">Klik "Load Full Log" untuk melihat output log lengkap</div>
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+
+            <!-- Full log output -->
+            <div id="fullLogContainer" class="hidden">
+              <div class="log-toolbar">
+                <span class="text-white/50 text-xs" id="logStatus">Loading...</span>
+                <div class="flex gap-2">
+                  <input type="text" id="logSearch" class="log-search" placeholder="Search log..." oninput="searchLog(this.value)" />
+                  <button class="glass-btn-sm" onclick="clearLog()">✕ Close</button>
+                </div>
+              </div>
+              <div class="log-output" id="logOutput"></div>
+            </div>
+          `
+        })()}
+      </div>
+    </div>
+
+    <script>
+    const OWNER='${owner}', REPO='${repo}', RUN_ID=${run?.id || 0};
+    const IS_ACTIVE=${isActive};
+    let currentJobId=${jobs[0]?.id || 0};
+    let autoScroll=true, pollTimer=null, logLines=[];
+
+    function showToast(msg,type='success'){
+      const t=document.getElementById('detail-toast');
+      t.textContent=msg;t.className='toast '+(type==='success'?'toast-success':'toast-error');
+      t.classList.remove('hidden');setTimeout(()=>t.classList.add('hidden'),4000);
+    }
+
+    // ── Job selection ──
+    function selectJob(jobId, jobName) {
+      document.querySelectorAll('.job-btn').forEach(b=>b.classList.remove('active'));
+      document.getElementById('jobbtn-'+jobId)?.classList.add('active');
+      document.getElementById('logJobName').textContent=jobName;
+      currentJobId=jobId;
+      clearLog();
+      loadJobLog(jobId);
+    }
+
+    // ── Steps toggle ──
+    function toggleStep(idx) {
+      const body=document.getElementById('step-body-'+idx);
+      const chev=document.getElementById('step-chevron-'+idx);
+      const open=!body.classList.contains('hidden');
+      body.classList.toggle('hidden',open);
+      chev.style.transform=open?'rotate(-90deg)':'rotate(0)';
+    }
+
+    // ── Load full log ──
+    async function loadJobLog(jobId) {
+      jobId=jobId||currentJobId;
+      document.getElementById('fullLogContainer').classList.remove('hidden');
+      document.getElementById('stepsList').style.display='none';
+      document.getElementById('loadLogBtn').disabled=true;
+      document.getElementById('logStatus').textContent='Loading log...';
+      const out=document.getElementById('logOutput');
+      out.textContent='';
+      try {
+        const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/jobs/\${jobId}/logs\`);
+        if(!res.ok){ out.textContent='Cannot load log ('+res.status+')'; return; }
+        const text=await res.text();
+        logLines=text.split('\\n');
+        renderLog(logLines);
+        document.getElementById('logStatus').textContent=logLines.length+' lines';
+        if(autoScroll) out.scrollTop=out.scrollHeight;
+      } catch(e){
+        out.textContent='Error: '+e.message;
+      } finally {
+        document.getElementById('loadLogBtn').disabled=false;
+      }
+    }
+
+    function renderLog(lines) {
+      const out=document.getElementById('logOutput');
+      out.innerHTML='';
+      const frag=document.createDocumentFragment();
+      lines.forEach((line,i)=>{
+        const el=document.createElement('div');
+        el.className='log-line';
+        // Colorize
+        if(line.includes('##[error]')||line.includes('Error:')||line.includes('FAILED')) el.classList.add('log-error');
+        else if(line.includes('##[warning]')||line.includes('Warning:')) el.classList.add('log-warn');
+        else if(line.includes('##[group]')||/^\\d{4}-\\d{2}-\\d{2}T/.test(line)) el.classList.add('log-timestamp');
+        else if(line.includes('Run ')||line.includes('Successfully')) el.classList.add('log-success');
+        const lineNum=document.createElement('span');
+        lineNum.className='log-linenum';lineNum.textContent=String(i+1).padStart(5,' ');
+        el.appendChild(lineNum);
+        const txt=document.createElement('span');
+        txt.textContent=line;
+        el.appendChild(txt);
+        frag.appendChild(el);
+      });
+      out.appendChild(frag);
+    }
+
+    function searchLog(q) {
+      const out=document.getElementById('logOutput');
+      const lines=out.querySelectorAll('.log-line');
+      const qLower=q.toLowerCase();
+      let found=0;
+      lines.forEach(el=>{
+        const text=el.textContent.toLowerCase();
+        if(!q||text.includes(qLower)){el.style.display='';found++;}
+        else el.style.display='none';
+      });
+      document.getElementById('logStatus').textContent=q?found+' matches':logLines.length+' lines';
+    }
+
+    function clearLog() {
+      document.getElementById('fullLogContainer').classList.add('hidden');
+      document.getElementById('stepsList').style.display='';
+      document.getElementById('logOutput').innerHTML='';
+    }
+
+    function toggleAutoScroll() {
+      autoScroll=!autoScroll;
+      document.getElementById('autoScrollBtn').textContent=autoScroll?'⬇ Auto-scroll':'⏸ Auto-scroll';
+      document.getElementById('autoScrollBtn').classList.toggle('active',autoScroll);
+    }
+
+    // ── Run actions ──
+    async function cancelRun(id) {
+      id=id||RUN_ID;
+      const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/runs/\${id}/cancel\`,{method:'POST'});
+      const d=await res.json();
+      if(d.success){showToast('Run dibatalkan!');setTimeout(()=>location.reload(),2000);}
+      else showToast('Gagal: '+(d.error||'unknown'),'error');
+    }
+    async function rerunAll() {
+      const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/runs/\${RUN_ID}/rerun\`,{method:'POST'});
+      const d=await res.json();
+      if(d.success){showToast('Re-run dimulai!');setTimeout(()=>location.reload(),2000);}
+      else showToast('Gagal: '+(d.detail?.message||d.error||'unknown'),'error');
+    }
+    async function rerunFailed() {
+      const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/runs/\${RUN_ID}/rerun-failed\`,{method:'POST'});
+      const d=await res.json();
+      if(d.success){showToast('Re-run failed jobs dimulai!');setTimeout(()=>location.reload(),2000);}
+      else showToast('Gagal: '+(d.detail?.message||d.error||'unknown'),'error');
+    }
+
+    // ── Live polling for active runs ──
+    async function pollStatus() {
+      try {
+        const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/runs/\${RUN_ID}/status\`);
+        const data=await res.json();
+        const run=data.run; const jobs=data.jobs?.jobs||[];
+        // Update badge
+        const bwrap=document.getElementById('runBadgeWrap');
+        if(bwrap && run) {
+          if(run.status==='in_progress') bwrap.innerHTML='<span class="run-badge run-running"><span class="pulse-dot"></span>in progress</span>';
+          else if(run.conclusion==='success'){bwrap.innerHTML='<span class="run-badge run-success">✓ success</span>';stopPoll();}
+          else if(run.conclusion==='failure'){bwrap.innerHTML='<span class="run-badge run-failure">✗ failure</span>';stopPoll();}
+          else if(run.conclusion==='cancelled'){bwrap.innerHTML='<span class="run-badge run-cancelled">⊘ cancelled</span>';stopPoll();}
+        }
+        // Update job statuses in sidebar
+        jobs.forEach(job=>{
+          const btn=document.getElementById('jobbtn-'+job.id);
+          if(btn){
+            const icon=btn.querySelector('.job-icon,.spin');
+            if(icon) icon.outerHTML=getJobIcon(job.status,job.conclusion);
+          }
+        });
+        // Duration
+        if(run?.run_started_at){
+          const s=Math.floor((new Date().getTime()-new Date(run.run_started_at).getTime())/1000);
+          const durEl=document.getElementById('runDuration');
+          if(durEl) durEl.textContent='⏱ '+(s<60?s+'s':Math.floor(s/60)+'m '+(s%60)+'s');
+        }
+        // Reload log if viewing
+        if(document.getElementById('fullLogContainer') && !document.getElementById('fullLogContainer').classList.contains('hidden')){
+          loadJobLog(currentJobId);
+        }
+      } catch(e){}
+    }
+
+    function getJobIcon(status,conclusion){
+      if(status==='in_progress') return '<span class="job-icon spin" style="color:#f59e0b">◌</span>';
+      if(status==='completed'){
+        if(conclusion==='success') return '<span class="job-icon" style="color:#22c55e">✓</span>';
+        if(conclusion==='failure') return '<span class="job-icon" style="color:#ef4444">✗</span>';
+        if(conclusion==='skipped') return '<span class="job-icon" style="color:#6b7280">⊝</span>';
+      }
+      return '<span class="job-icon" style="color:#6b7280">○</span>';
+    }
+
+    function stopPoll(){clearInterval(pollTimer);pollTimer=null;}
+
+    if(IS_ACTIVE){
+      pollTimer=setInterval(pollStatus,4000);
+      // Auto-load log of first in-progress job
+      const firstJob=${jobs[0]?.id || 0};
+      if(firstJob) setTimeout(()=>loadJobLog(firstJob),800);
+    }
+    </script>
+  `
+  return glassLayout(`Run #${run?.run_number} - ${run?.name} - ${repo}`, user, content)
 }
 
 function releasesPage(user: any, owner: string, repo: string, releases: any[], repoData: any) {
