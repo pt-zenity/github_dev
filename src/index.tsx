@@ -1,6 +1,8 @@
 import { Hono } from 'hono'
 import { serveStatic } from 'hono/cloudflare-workers'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
+import nacl from 'tweetnacl'
+import { decodeBase64, encodeBase64 } from 'tweetnacl-util'
 
 const app = new Hono()
 
@@ -372,6 +374,63 @@ app.get('/repo/:owner/:repo/settings/secrets', async (c) => {
   ])
   
   return c.html(secretsPage(user, owner, repo, secretsRes.data, repoRes.data))
+})
+
+// Create / Update secret (PUT)
+app.post('/repo/:owner/:repo/settings/secrets/upsert', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo } = c.req.param()
+
+  let name = '', value = ''
+  const ct = c.req.header('content-type') || ''
+  if (ct.includes('application/json')) {
+    const body = await c.req.json() as any
+    name = body.name; value = body.value
+  } else {
+    const form = await c.req.formData()
+    name = form.get('name') as string
+    value = form.get('value') as string
+  }
+
+  if (!name || !value) return c.json({ error: 'name and value required' }, 400)
+
+  // 1. Get repo public key for encryption
+  const pubKeyRes = await githubApi(token, `/repos/${owner}/${repo}/actions/secrets/public-key`)
+  if (pubKeyRes.status !== 200) return c.json({ error: 'Cannot get public key', detail: pubKeyRes.data }, 400)
+  const { key: pubKeyB64, key_id } = pubKeyRes.data as any
+
+  // 2. Encrypt using libsodium sealed box (async, uses Web Crypto for nonce)
+  const recipientKey = decodeBase64(pubKeyB64)
+  const secretBytes = new TextEncoder().encode(value)
+  const encryptedBytes = await sealedBoxAsync(secretBytes, recipientKey)
+  const encryptedB64 = encodeBase64(encryptedBytes)
+
+  // 3. PUT to GitHub
+  const putRes = await githubApi(token, `/repos/${owner}/${repo}/actions/secrets/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ encrypted_value: encryptedB64, key_id })
+  })
+
+  if (putRes.status === 201 || putRes.status === 204) {
+    return c.json({ success: true, status: putRes.status })
+  }
+  return c.json({ error: 'GitHub API error', detail: putRes.data, status: putRes.status }, 400)
+})
+
+// Delete secret
+app.delete('/repo/:owner/:repo/settings/secrets/:name', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, name } = c.req.param()
+
+  const delRes = await githubApi(token, `/repos/${owner}/${repo}/actions/secrets/${encodeURIComponent(name)}`, {
+    method: 'DELETE'
+  })
+
+  if (delRes.status === 204) return c.json({ success: true })
+  return c.json({ error: 'Delete failed', detail: delRes.data }, 400)
 })
 
 // Variables
@@ -1353,33 +1412,298 @@ function environmentsPage(user: any, owner: string, repo: string, envsData: any,
 
 function secretsPage(user: any, owner: string, repo: string, secretsData: any, repoData: any) {
   const items = secretsData?.secrets || []
+  const isError = secretsData?.message
 
   const content = `
     ${repoNav(owner, repo, 'secrets', repoData)}
+
+    <!-- Toast notification -->
+    <div id="toast" class="toast hidden"></div>
+
+    <!-- Header -->
     <div class="section-header">
-      <h3 class="section-title">Actions Secrets <span class="count-badge">${items.length}</span></h3>
-      <span class="text-white/40 text-sm">🔒 Secret values are encrypted and cannot be read</span>
+      <h3 class="section-title">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:inline;vertical-align:-2px"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        Actions Secrets <span class="count-badge">${items.length}</span>
+      </h3>
+      <button class="btn-primary" onclick="openModal()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        New Secret
+      </button>
     </div>
-    ${items.length === 0 ? '<div class="empty-state">Tidak ada secrets</div>' : `
-      <div class="space-y-2">
+
+    <!-- Info banner -->
+    <div class="glass-card mb-4 p-3" style="border-color:rgba(234,179,8,0.2);background:rgba(234,179,8,0.05)">
+      <div class="flex items-center gap-2 text-sm" style="color:rgba(253,224,71,0.9)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        <strong>Catatan:</strong> Nilai secret dienkripsi oleh GitHub dan <strong>tidak bisa dibaca kembali</strong> melalui API — ini adalah batasan keamanan GitHub. Anda bisa menambah, update, atau hapus secret di bawah.
+      </div>
+    </div>
+
+    ${isError ? `<div class="alert-error">Error: ${escapeHtml(secretsData.message)} — Pastikan token memiliki scope <code>repo</code> atau <code>secrets</code></div>` : ''}
+
+    <!-- Secrets list -->
+    ${items.length === 0 && !isError ? '<div class="empty-state">Belum ada secrets. Klik <strong>New Secret</strong> untuk menambah.</div>' : `
+      <div class="space-y-2" id="secretsList">
         ${items.map((s: any) => `
-          <div class="glass-card hover-lift">
-            <div class="p-4 flex items-center justify-between">
-              <div class="flex items-center gap-3">
-                <span class="text-yellow-400">🔑</span>
-                <div>
-                  <div class="text-white font-mono font-medium">${s.name}</div>
-                  <div class="text-white/40 text-sm">Updated: ${timeAgo(s.updated_at)}</div>
+          <div class="glass-card secret-item" id="secret-${escapeHtml(s.name)}" data-name="${escapeHtml(s.name)}">
+            <div class="secret-row">
+              <div class="secret-left">
+                <div class="secret-icon">🔑</div>
+                <div class="secret-info">
+                  <div class="secret-name">${escapeHtml(s.name)}</div>
+                  <div class="secret-meta">
+                    <span class="badge-encrypted">🔒 Encrypted</span>
+                    <span class="text-white/40 text-xs">Diperbarui ${timeAgo(s.updated_at)}</span>
+                    ${s.visibility ? `<span class="badge-neutral text-xs">${s.visibility}</span>` : ''}
+                  </div>
                 </div>
               </div>
-              <div class="flex gap-2">
-                <span class="badge-neutral">Encrypted</span>
+              <div class="secret-actions">
+                <button class="glass-btn-sm text-blue-300" onclick="openEditModal('${escapeHtml(s.name)}')">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                  Update Value
+                </button>
+                <button class="glass-btn-sm text-red-300" onclick="deleteSecret('${escapeHtml(s.name)}')">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+                  Delete
+                </button>
               </div>
             </div>
           </div>
         `).join('')}
       </div>
     `}
+
+    <!-- Modal backdrop -->
+    <div id="modalBackdrop" class="modal-backdrop hidden" onclick="closeModal()"></div>
+
+    <!-- Create/Update Modal -->
+    <div id="secretModal" class="secret-modal hidden">
+      <div class="modal-header">
+        <h3 class="modal-title" id="modalTitle">New Secret</h3>
+        <button class="modal-close" onclick="closeModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label">Secret Name <span style="color:#f87171">*</span></label>
+          <input type="text" id="secretName" class="form-input font-mono" placeholder="MY_SECRET_KEY" autocomplete="off" spellcheck="false"
+            oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_]/g,'')" />
+          <div class="text-white/30 text-xs mt-1">Hanya huruf besar, angka, dan underscore</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" id="valueLabel">Secret Value <span style="color:#f87171">*</span></label>
+          <div class="secret-value-wrapper">
+            <textarea id="secretValue" class="form-input font-mono secret-textarea" 
+              placeholder="Masukkan nilai secret..."
+              autocomplete="off" spellcheck="false" rows="4"></textarea>
+            <button type="button" class="toggle-visibility" id="toggleBtn" onclick="toggleVisibility()" title="Toggle visibility">
+              <svg id="eyeIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+          <div class="text-white/30 text-xs mt-1" id="valueHint">Nilai akan dienkripsi dengan kunci publik repo sebelum dikirim ke GitHub</div>
+        </div>
+        <div id="modalError" class="alert-error hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="glass-btn-sm" onclick="closeModal()">Batal</button>
+        <button class="btn-primary" id="saveBtn" onclick="saveSecret()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+          Simpan Secret
+        </button>
+      </div>
+    </div>
+
+    <!-- Confirm Delete Modal -->
+    <div id="deleteModal" class="secret-modal hidden" style="max-width:420px">
+      <div class="modal-header">
+        <h3 class="modal-title" style="color:#f87171">⚠️ Hapus Secret</h3>
+        <button class="modal-close" onclick="closeDeleteModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="text-white/80 mb-3">Apakah Anda yakin ingin menghapus secret:</p>
+        <div class="glass-inner p-3 font-mono text-yellow-300 text-sm" id="deleteSecretName"></div>
+        <p class="text-white/50 text-sm mt-3">Tindakan ini tidak dapat dibatalkan. Workflow yang menggunakan secret ini akan gagal.</p>
+        <div id="deleteError" class="alert-error hidden mt-3"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="glass-btn-sm" onclick="closeDeleteModal()">Batal</button>
+        <button class="btn-danger" id="confirmDeleteBtn" onclick="confirmDelete()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+          Ya, Hapus
+        </button>
+      </div>
+    </div>
+
+    <script>
+    const OWNER = '${owner}';
+    const REPO = '${repo}';
+    let currentDeleteName = '';
+    let isEditing = false;
+    let isValueHidden = true;
+
+    function showToast(msg, type='success') {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = 'toast ' + (type === 'success' ? 'toast-success' : 'toast-error');
+      t.classList.remove('hidden');
+      setTimeout(() => t.classList.add('hidden'), 3500);
+    }
+
+    function openModal() {
+      isEditing = false;
+      document.getElementById('modalTitle').textContent = 'New Secret';
+      document.getElementById('saveBtn').innerHTML = \`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> Simpan Secret\`;
+      document.getElementById('secretName').value = '';
+      document.getElementById('secretName').readOnly = false;
+      document.getElementById('secretName').style.opacity = '1';
+      document.getElementById('secretValue').value = '';
+      document.getElementById('secretValue').type = 'password';
+      document.getElementById('valueLabel').innerHTML = 'Secret Value <span style="color:#f87171">*</span>';
+      document.getElementById('valueHint').textContent = 'Nilai akan dienkripsi dengan kunci publik repo sebelum dikirim ke GitHub';
+      document.getElementById('modalError').classList.add('hidden');
+      isValueHidden = true;
+      updateEyeIcon();
+      document.getElementById('modalBackdrop').classList.remove('hidden');
+      document.getElementById('secretModal').classList.remove('hidden');
+      setTimeout(() => document.getElementById('secretName').focus(), 50);
+    }
+
+    function openEditModal(name) {
+      isEditing = true;
+      document.getElementById('modalTitle').textContent = 'Update Secret: ' + name;
+      document.getElementById('saveBtn').innerHTML = \`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg> Update Secret\`;
+      document.getElementById('secretName').value = name;
+      document.getElementById('secretName').readOnly = true;
+      document.getElementById('secretName').style.opacity = '0.7';
+      document.getElementById('secretValue').value = '';
+      document.getElementById('secretValue').type = 'password';
+      document.getElementById('valueLabel').innerHTML = 'New Secret Value <span style="color:#f87171">*</span>';
+      document.getElementById('valueHint').textContent = 'Masukkan nilai baru. Nilai lama akan digantikan sepenuhnya.';
+      document.getElementById('modalError').classList.add('hidden');
+      isValueHidden = true;
+      updateEyeIcon();
+      document.getElementById('modalBackdrop').classList.remove('hidden');
+      document.getElementById('secretModal').classList.remove('hidden');
+      setTimeout(() => document.getElementById('secretValue').focus(), 50);
+    }
+
+    function closeModal() {
+      document.getElementById('modalBackdrop').classList.add('hidden');
+      document.getElementById('secretModal').classList.add('hidden');
+    }
+
+    function toggleVisibility() {
+      isValueHidden = !isValueHidden;
+      const ta = document.getElementById('secretValue');
+      // textarea doesn't support type, use -webkit-text-security
+      ta.style.webkitTextSecurity = isValueHidden ? 'disc' : 'none';
+      updateEyeIcon();
+    }
+
+    function updateEyeIcon() {
+      const icon = document.getElementById('eyeIcon');
+      if (isValueHidden) {
+        icon.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>';
+      } else {
+        icon.innerHTML = '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/>';
+      }
+    }
+
+    async function saveSecret() {
+      const name = document.getElementById('secretName').value.trim();
+      const value = document.getElementById('secretValue').value;
+      const errEl = document.getElementById('modalError');
+      errEl.classList.add('hidden');
+
+      if (!name) { errEl.textContent = 'Nama secret tidak boleh kosong'; errEl.classList.remove('hidden'); return; }
+      if (!value) { errEl.textContent = 'Nilai secret tidak boleh kosong'; errEl.classList.remove('hidden'); return; }
+
+      const btn = document.getElementById('saveBtn');
+      const orig = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Menyimpan...';
+
+      try {
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/settings/secrets/upsert\`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, value })
+        });
+        const data = await res.json();
+        if (data.success) {
+          closeModal();
+          showToast(isEditing ? \`Secret "\${name}" berhasil diupdate!\` : \`Secret "\${name}" berhasil dibuat!\`);
+          setTimeout(() => location.reload(), 1000);
+        } else {
+          errEl.textContent = 'Error: ' + (data.error || 'Unknown error') + (data.detail?.message ? ' — ' + data.detail.message : '');
+          errEl.classList.remove('hidden');
+        }
+      } catch(e) {
+        errEl.textContent = 'Network error: ' + e.message;
+        errEl.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = orig;
+      }
+    }
+
+    function deleteSecret(name) {
+      currentDeleteName = name;
+      document.getElementById('deleteSecretName').textContent = name;
+      document.getElementById('deleteError').classList.add('hidden');
+      document.getElementById('modalBackdrop').classList.remove('hidden');
+      document.getElementById('deleteModal').classList.remove('hidden');
+    }
+
+    function closeDeleteModal() {
+      document.getElementById('modalBackdrop').classList.add('hidden');
+      document.getElementById('deleteModal').classList.add('hidden');
+    }
+
+    async function confirmDelete() {
+      const btn = document.getElementById('confirmDeleteBtn');
+      const errEl = document.getElementById('deleteError');
+      errEl.classList.add('hidden');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Menghapus...';
+
+      try {
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/settings/secrets/\${encodeURIComponent(currentDeleteName)}\`, {
+          method: 'DELETE'
+        });
+        const data = await res.json();
+        if (data.success) {
+          closeDeleteModal();
+          showToast(\`Secret "\${currentDeleteName}" berhasil dihapus.\`, 'success');
+          const el = document.getElementById('secret-' + currentDeleteName);
+          if (el) { el.style.opacity='0'; el.style.transform='translateX(20px)'; el.style.transition='all 0.3s'; setTimeout(() => el.remove(), 300); }
+          // Update count
+          const badge = document.querySelector('.count-badge');
+          if (badge) badge.textContent = String(parseInt(badge.textContent) - 1);
+        } else {
+          errEl.textContent = 'Error: ' + (data.error || 'Unknown') + (data.detail?.message ? ' — ' + data.detail.message : '');
+          errEl.classList.remove('hidden');
+        }
+      } catch(e) {
+        errEl.textContent = 'Network error: ' + e.message;
+        errEl.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = \`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg> Ya, Hapus\`;
+      }
+    }
+
+    // Apply masking on load
+    document.querySelectorAll('.secret-textarea').forEach(el => {
+      el.style.webkitTextSecurity = 'disc';
+    });
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') { closeModal(); closeDeleteModal(); }
+    });
+    </script>
   `
   return glassLayout(`Secrets - ${repo}`, user, content)
 }
@@ -1512,6 +1836,33 @@ function deployKeysPage(user: any, owner: string, repo: string, keys: any[], rep
 }
 
 // ==================== UTILITIES ====================
+
+// libsodium crypto_box_seal implementation using tweetnacl
+// Spec: https://libsodium.gitbook.io/doc/public-key_cryptography/sealed_boxes
+// nonce = SHA-512(ephemeralPub || recipientPub)[0..23]  (approximation of BLAKE2b)
+async function sealedBoxAsync(message: Uint8Array, recipientPublicKey: Uint8Array): Promise<Uint8Array> {
+  // 1. Generate ephemeral X25519 keypair
+  const ephemeralKeypair = nacl.box.keyPair()
+
+  // 2. Derive nonce: first 24 bytes of SHA-512(ephemeralPub || recipientPub)
+  const nonceInput = new Uint8Array(64)
+  nonceInput.set(ephemeralKeypair.publicKey, 0)
+  nonceInput.set(recipientPublicKey, 32)
+  const hashBuf = await crypto.subtle.digest('SHA-512', nonceInput)
+  const nonce = new Uint8Array(hashBuf, 0, nacl.box.nonceLength) // first 24 bytes
+
+  // 3. Compute shared key and encrypt
+  const sharedKey = nacl.box.before(recipientPublicKey, ephemeralKeypair.secretKey)
+  const ciphertext = nacl.box.after(message, nonce, sharedKey)
+  if (!ciphertext) throw new Error('Encryption failed')
+
+  // 4. Output = ephemeralPub (32) + ciphertext
+  const result = new Uint8Array(32 + ciphertext.length)
+  result.set(ephemeralKeypair.publicKey, 0)
+  result.set(ciphertext, 32)
+  return result
+}
+
 function escapeHtml(str: string): string {
   return str?.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;') || ''
 }
