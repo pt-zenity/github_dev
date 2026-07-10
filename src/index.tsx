@@ -364,54 +364,53 @@ app.get('/repo/:owner/:repo/actions/runs/:runId/status', async (c) => {
 })
 
 // API: Get job log
+// Strategy: let GitHub redirect us, then immediately pipe the blob response
+// back as a stream — single RTT, no "blob expired" race condition.
 app.get('/repo/:owner/:repo/actions/jobs/:jobId/logs', async (c) => {
   const token = getToken(c)
   if (!token) return c.json({ error: 'Unauthorized' }, 401)
   const { owner, repo, jobId } = c.req.param()
 
   try {
-    // Step 1: Get the redirect URL (do NOT follow redirect)
-    const resp1 = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/jobs/${jobId}/logs`, {
+    // Follow the redirect in one fetch — Cloudflare Workers will follow the
+    // 302 → Azure blob URL atomically, so the pre-signed URL never expires
+    // between the two hops.
+    const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/jobs/${jobId}/logs`, {
       headers: {
         'Authorization': `Bearer ${token}`,
         'Accept': 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
         'User-Agent': 'GitManager/1.0'
       },
-      redirect: 'manual'  // Don't follow — capture the redirect URL
+      redirect: 'follow'   // let fetch handle the 302 → Azure blob in one shot
     })
 
-    // GitHub returns 302 with Location header pointing to Azure blob
-    if (resp1.status === 302 || resp1.status === 301) {
-      const logUrl = resp1.headers.get('location')
-      if (!logUrl) return c.text('No redirect location found', 400)
-
-      // Step 2: Fetch the actual log from the blob URL
-      const resp2 = await fetch(logUrl, {
-        headers: { 'User-Agent': 'GitManager/1.0' }
-      })
-      if (!resp2.ok) return c.text(`Failed to fetch log blob: ${resp2.status} ${resp2.statusText}`, 400)
-
-      const logText = await resp2.text()
-      return new Response(logText, {
+    if (resp.ok) {
+      // Stream the blob body straight back to the browser
+      return new Response(resp.body, {
         headers: {
           'Content-Type': 'text/plain; charset=utf-8',
-          'Cache-Control': 'no-store'
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff'
         }
       })
     }
 
-    // Sometimes GitHub returns 200 directly (cached / small logs)
-    if (resp1.status === 200) {
-      const logText = await resp1.text()
-      return new Response(logText, {
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-      })
+    // 403 — token missing scope
+    if (resp.status === 403) {
+      return c.text('403 Forbidden — token tidak punya izin baca logs. Butuh scope: repo atau actions:read', 403)
+    }
+    // 404 — job log not available yet or already deleted
+    if (resp.status === 404) {
+      return c.text('404 — log belum tersedia (job mungkin masih berjalan atau log sudah dihapus)', 404)
+    }
+    // 410 — GitHub deleted the log
+    if (resp.status === 410) {
+      return c.text('410 Gone — log sudah expired / dihapus GitHub', 410)
     }
 
-    // Other errors — return detail for debugging
-    const body = await resp1.text().catch(() => '')
-    return c.text(`GitHub API returned ${resp1.status}: ${body}`, 400)
+    const body = await resp.text().catch(() => '')
+    return c.text(`GitHub API returned ${resp.status}: ${body.substring(0, 300)}`, 400)
 
   } catch (err: any) {
     return c.text(`Server error: ${err?.message || err}`, 500)
@@ -2073,15 +2072,18 @@ function runDetailPage(user: any, owner: string, repo: string, run: any, jobsDat
         const contentType = res.headers.get('content-type') || '';
 
         if (!res.ok) {
-          // Try to get error text
           const errText = await res.text().catch(() => '');
-          let msg = 'Cannot load log (' + res.status + ')';
-          if (res.status === 403) msg = '403 Forbidden — Token tidak punya izin membaca logs. Butuh scope: repo atau actions:read';
-          else if (res.status === 404) msg = '404 — Log tidak ditemukan (run mungkin belum selesai atau sudah dihapus)';
-          else if (res.status === 410) msg = '410 Gone — Log sudah expired / dihapus GitHub';
-          else if (errText) msg += ': ' + errText.substring(0, 200);
+          let msg = '';
+          if (res.status === 403)
+            msg = '🔒 Token tidak punya izin membaca logs. Tambahkan scope: repo atau actions:read pada Personal Access Token Anda.';
+          else if (res.status === 404)
+            msg = '📭 Log belum tersedia — job mungkin masih berjalan, belum pernah dijalankan, atau log sudah terhapus. Coba lagi setelah job selesai.';
+          else if (res.status === 410)
+            msg = '🗑 Log sudah kadaluarsa atau dihapus oleh GitHub (biasanya setelah 90 hari).';
+          else
+            msg = 'Gagal memuat log (' + res.status + ')' + (errText ? ': ' + errText.substring(0, 300) : '');
 
-          out.innerHTML = \`<div class="log-line log-error"><span class="log-linenum">  ERR</span><span>⚠ \${escHtml(msg)}</span></div>\`;
+          out.innerHTML = \`<div class="log-line log-error"><span class="log-linenum">  ERR</span><span class="log-content">\${escHtml(msg)}</span></div>\`;
           statusEl.textContent = 'Error';
           return;
         }
