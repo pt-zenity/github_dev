@@ -368,19 +368,84 @@ app.get('/repo/:owner/:repo/actions/jobs/:jobId/logs', async (c) => {
   const token = getToken(c)
   if (!token) return c.json({ error: 'Unauthorized' }, 401)
   const { owner, repo, jobId } = c.req.param()
-  // GitHub returns redirect to actual log URL
-  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/jobs/${jobId}/logs`, {
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Accept': 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'GitManager/1.0'
-    },
-    redirect: 'follow'
-  })
-  if (!resp.ok) return c.json({ error: 'Cannot fetch logs', status: resp.status }, 400)
-  const logText = await resp.text()
-  return c.text(logText)
+
+  try {
+    // Step 1: Get the redirect URL (do NOT follow redirect)
+    const resp1 = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/jobs/${jobId}/logs`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'GitManager/1.0'
+      },
+      redirect: 'manual'  // Don't follow — capture the redirect URL
+    })
+
+    // GitHub returns 302 with Location header pointing to Azure blob
+    if (resp1.status === 302 || resp1.status === 301) {
+      const logUrl = resp1.headers.get('location')
+      if (!logUrl) return c.text('No redirect location found', 400)
+
+      // Step 2: Fetch the actual log from the blob URL
+      const resp2 = await fetch(logUrl, {
+        headers: { 'User-Agent': 'GitManager/1.0' }
+      })
+      if (!resp2.ok) return c.text(`Failed to fetch log blob: ${resp2.status} ${resp2.statusText}`, 400)
+
+      const logText = await resp2.text()
+      return new Response(logText, {
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-store'
+        }
+      })
+    }
+
+    // Sometimes GitHub returns 200 directly (cached / small logs)
+    if (resp1.status === 200) {
+      const logText = await resp1.text()
+      return new Response(logText, {
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+      })
+    }
+
+    // Other errors — return detail for debugging
+    const body = await resp1.text().catch(() => '')
+    return c.text(`GitHub API returned ${resp1.status}: ${body}`, 400)
+
+  } catch (err: any) {
+    return c.text(`Server error: ${err?.message || err}`, 500)
+  }
+})
+
+// Run-level logs (full zip → text, all jobs combined)
+app.get('/repo/:owner/:repo/actions/runs/:runId/logs', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, runId } = c.req.param()
+
+  try {
+    const resp1 = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/logs`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'GitManager/1.0'
+      },
+      redirect: 'manual'
+    })
+
+    if (resp1.status === 302 || resp1.status === 301) {
+      const logUrl = resp1.headers.get('location')
+      if (!logUrl) return c.text('No redirect location', 400)
+      // The run log is a zip file — return the URL so client can show it
+      return c.json({ redirect_url: logUrl })
+    }
+
+    return c.text(`GitHub returned ${resp1.status}`, 400)
+  } catch (err: any) {
+    return c.text(`Server error: ${err?.message || err}`, 500)
+  }
 })
 
 // API: Trigger workflow dispatch
@@ -1989,45 +2054,116 @@ function runDetailPage(user: any, owner: string, repo: string, run: any, jobsDat
 
     // ── Load full log ──
     async function loadJobLog(jobId) {
-      jobId=jobId||currentJobId;
-      document.getElementById('fullLogContainer').classList.remove('hidden');
-      document.getElementById('stepsList').style.display='none';
-      document.getElementById('loadLogBtn').disabled=true;
-      document.getElementById('logStatus').textContent='Loading log...';
-      const out=document.getElementById('logOutput');
-      out.textContent='';
+      jobId = jobId || currentJobId;
+      currentJobId = jobId;
+      const container = document.getElementById('fullLogContainer');
+      const stepsList = document.getElementById('stepsList');
+      const loadBtn = document.getElementById('loadLogBtn');
+      const statusEl = document.getElementById('logStatus');
+      const out = document.getElementById('logOutput');
+
+      container.classList.remove('hidden');
+      stepsList.style.display = 'none';
+      if(loadBtn) loadBtn.disabled = true;
+      statusEl.textContent = 'Loading log...';
+      out.innerHTML = '<div class="log-line"><span class="log-linenum">     </span><span class="log-timestamp">⟳ Fetching log from GitHub...</span></div>';
+
       try {
-        const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/jobs/\${jobId}/logs\`);
-        if(!res.ok){ out.textContent='Cannot load log ('+res.status+')'; return; }
-        const text=await res.text();
-        logLines=text.split('\\n');
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/actions/jobs/\${jobId}/logs\`);
+        const contentType = res.headers.get('content-type') || '';
+
+        if (!res.ok) {
+          // Try to get error text
+          const errText = await res.text().catch(() => '');
+          let msg = 'Cannot load log (' + res.status + ')';
+          if (res.status === 403) msg = '403 Forbidden — Token tidak punya izin membaca logs. Butuh scope: repo atau actions:read';
+          else if (res.status === 404) msg = '404 — Log tidak ditemukan (run mungkin belum selesai atau sudah dihapus)';
+          else if (res.status === 410) msg = '410 Gone — Log sudah expired / dihapus GitHub';
+          else if (errText) msg += ': ' + errText.substring(0, 200);
+
+          out.innerHTML = \`<div class="log-line log-error"><span class="log-linenum">  ERR</span><span>⚠ \${escHtml(msg)}</span></div>\`;
+          statusEl.textContent = 'Error';
+          return;
+        }
+
+        const text = await res.text();
+        if (!text || text.trim() === '') {
+          out.innerHTML = '<div class="log-line log-timestamp"><span class="log-linenum">     </span><span>Log kosong — job mungkin belum menghasilkan output</span></div>';
+          statusEl.textContent = '0 lines';
+          return;
+        }
+
+        logLines = text.split('\\n');
         renderLog(logLines);
-        document.getElementById('logStatus').textContent=logLines.length+' lines';
-        if(autoScroll) out.scrollTop=out.scrollHeight;
-      } catch(e){
-        out.textContent='Error: '+e.message;
+        statusEl.textContent = logLines.length + ' lines';
+        if (autoScroll) setTimeout(() => { out.scrollTop = out.scrollHeight; }, 50);
+
+      } catch(e) {
+        out.innerHTML = \`<div class="log-line log-error"><span class="log-linenum">  ERR</span><span>Network error: \${escHtml(e.message)}</span></div>\`;
+        statusEl.textContent = 'Error';
       } finally {
-        document.getElementById('loadLogBtn').disabled=false;
+        if(loadBtn) loadBtn.disabled = false;
       }
     }
 
+    function escHtml(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
     function renderLog(lines) {
-      const out=document.getElementById('logOutput');
-      out.innerHTML='';
-      const frag=document.createDocumentFragment();
-      lines.forEach((line,i)=>{
-        const el=document.createElement('div');
-        el.className='log-line';
-        // Colorize
-        if(line.includes('##[error]')||line.includes('Error:')||line.includes('FAILED')) el.classList.add('log-error');
-        else if(line.includes('##[warning]')||line.includes('Warning:')) el.classList.add('log-warn');
-        else if(line.includes('##[group]')||/^\\d{4}-\\d{2}-\\d{2}T/.test(line)) el.classList.add('log-timestamp');
-        else if(line.includes('Run ')||line.includes('Successfully')) el.classList.add('log-success');
-        const lineNum=document.createElement('span');
-        lineNum.className='log-linenum';lineNum.textContent=String(i+1).padStart(5,' ');
+      const out = document.getElementById('logOutput');
+      out.innerHTML = '';
+      const frag = document.createDocumentFragment();
+
+      lines.forEach((rawLine, i) => {
+        // Strip GitHub's timestamp prefix: "2024-01-01T00:00:00.0000000Z "
+        const tsMatch = rawLine.match(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?(.*)$/);
+        const ts = tsMatch ? rawLine.substring(0, rawLine.indexOf(' ')) : '';
+        const line = tsMatch ? tsMatch[1] : rawLine;
+
+        const el = document.createElement('div');
+        el.className = 'log-line';
+        el.id = 'logline-' + i;
+
+        // Colorize by content
+        const l = line.toLowerCase();
+        if (line.includes('##[error]') || /\berror\b/.test(l) || line.includes('FAILED') || line.includes('BUILD FAILURE')) {
+          el.classList.add('log-error');
+        } else if (line.includes('##[warning]') || /\bwarning\b/.test(l) || line.includes('WARN')) {
+          el.classList.add('log-warn');
+        } else if (line.includes('##[group]') || line.includes('##[endgroup]')) {
+          el.classList.add('log-group');
+        } else if (line.includes('##[section]') || /^(Run|Build|Test|Deploy|Install|Step|Job)/.test(line)) {
+          el.classList.add('log-section');
+        } else if (/successfully|passed|success|done/i.test(l)) {
+          el.classList.add('log-success');
+        } else if (ts) {
+          el.classList.add('log-normal');
+        }
+
+        // Line number
+        const lineNum = document.createElement('span');
+        lineNum.className = 'log-linenum';
+        lineNum.textContent = String(i + 1).padStart(5, ' ');
         el.appendChild(lineNum);
-        const txt=document.createElement('span');
-        txt.textContent=line;
+
+        // Timestamp (dimmed)
+        if (ts) {
+          const tsEl = document.createElement('span');
+          tsEl.className = 'log-ts';
+          tsEl.textContent = ts.substring(11, 19) + ' '; // show only HH:MM:SS
+          el.appendChild(tsEl);
+        }
+
+        // Content
+        const txt = document.createElement('span');
+        // Strip ##[group], ##[error] markers for cleaner display
+        txt.textContent = line
+          .replace(/##\[group\]/g, '▶ ')
+          .replace(/##\[endgroup\]/g, '◀ ')
+          .replace(/##\[error\]/g, '✗ ')
+          .replace(/##\[warning\]/g, '⚠ ')
+          .replace(/##\[section\]/g, '§ ');
         el.appendChild(txt);
         frag.appendChild(el);
       });

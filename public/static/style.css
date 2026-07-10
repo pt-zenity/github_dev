@@ -528,11 +528,15 @@ pre { background: rgba(0,0,0,0.3); border-radius: 0 0 12px 12px; }
 }
 .log-line { display: flex; align-items: flex-start; padding: 1px 12px; white-space: pre; }
 .log-line:hover { background: rgba(255,255,255,0.04); }
-.log-linenum { color: rgba(255,255,255,0.2); min-width: 48px; user-select: none; flex-shrink: 0; margin-right: 12px; }
+.log-linenum { color: rgba(255,255,255,0.2); min-width: 48px; user-select: none; flex-shrink: 0; margin-right: 8px; }
+.log-ts { color: rgba(255,255,255,0.18); min-width: 60px; flex-shrink: 0; margin-right: 6px; font-size: 11px; }
 .log-error { background: rgba(239,68,68,0.08) !important; color: #fca5a5; }
-.log-warn { background: rgba(234,179,8,0.06) !important; color: #fde047; }
+.log-warn  { background: rgba(234,179,8,0.06) !important; color: #fde047; }
 .log-timestamp { color: rgba(255,255,255,0.35); }
 .log-success { color: #86efac; }
+.log-group   { color: #93c5fd; font-weight: 600; background: rgba(99,102,241,0.06); }
+.log-section { color: #c4b5fd; }
+.log-normal  { color: rgba(255,255,255,0.75); }
 
 /* Steps accordion */
 .steps-list { padding: 8px 0; overflow-y: auto; flex: 1; }
