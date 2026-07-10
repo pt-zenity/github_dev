@@ -525,34 +525,36 @@ pre { background: rgba(0,0,0,0.3); border-radius: 0 0 12px 12px; }
   flex: 1; overflow-y: auto; overflow-x: auto;
   background: #0d1117; padding: 8px 0;
   font-family: 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
-  font-size: 12px; line-height: 1.6;
+  font-size: 12px; line-height: 1.65;
   max-height: 500px;
 }
 
 /* ── Log line base ────────────────────────────────────────────────────── */
-.log-line         { display: flex; align-items: baseline; padding: 1px 12px; white-space: pre; color: rgba(255,255,255,0.72); }
+/* white-space:nowrap keeps the flex row on one visual line;             */
+/* the content span uses pre-wrap so actual newlines inside content wrap */
+.log-line         { display: flex; align-items: baseline; padding: 1px 12px; white-space: nowrap; color: rgba(255,255,255,0.72); }
 .log-line:hover   { background: rgba(255,255,255,0.035); }
-.log-blank        { min-height: 6px; padding: 0 12px; }
+.log-blank        { height: 5px; padding: 0; }
 
-/* ── Gutter columns ───────────────────────────────────────────────────── */
+/* ── Gutter columns (fixed-width, non-selectable) ─────────────────────── */
 .log-linenum {
-  color: rgba(255,255,255,0.18); min-width: 44px;
+  color: rgba(255,255,255,0.16); min-width: 42px;
   user-select: none; flex-shrink: 0;
   margin-right: 10px; text-align: right;
-}
-.log-ts {
-  color: rgba(255,255,255,0.22); min-width: 68px;
-  flex-shrink: 0; margin-right: 6px;
-  font-size: 10.5px; letter-spacing: 0.02em;
   font-variant-numeric: tabular-nums;
 }
-.log-icon {
-  flex-shrink: 0; width: 18px; margin-right: 4px;
-  text-align: center;
+.log-ts {
+  color: rgba(255,255,255,0.22); width: 68px; flex-shrink: 0;
+  margin-right: 8px; font-size: 10.5px;
+  font-variant-numeric: tabular-nums; letter-spacing: 0.02em;
+  user-select: none;
 }
+.log-indent { display: inline-block; flex-shrink: 0; }
+.log-icon   { flex-shrink: 0; width: 16px; margin-right: 6px; text-align: center; }
 
 /* ── Content span ─────────────────────────────────────────────────────── */
-.log-content { white-space: pre-wrap; word-break: break-all; min-width: 0; }
+/* pre-wrap: honour spaces/tabs already in the text; wrap long lines     */
+.log-content { white-space: pre-wrap; word-break: break-word; min-width: 0; flex: 1; }
 
 /* ── Line-type colours ────────────────────────────────────────────────── */
 /* error */
@@ -599,11 +601,15 @@ pre { background: rgba(0,0,0,0.3); border-radius: 0 0 12px 12px; }
 /* legacy alias kept for old code */
 .log-timestamp      { color: rgba(255,255,255,0.35); }
 
-/* ── Key-value indented pairs ─────────────────────────────────────────── */
-.log-kv             { color: rgba(255,255,255,0.55); }
-.log-kv-key         { color: #94a3b8; }
-.log-kv-sep         { color: rgba(255,255,255,0.25); }
-.log-kv-val         { color: #e2e8f0; }
+/* ── Key-value indented pairs  (e.g. "  image: ***/vas") ─────────────── */
+.log-kv             { color: rgba(255,255,255,0.6); }
+.log-kv-key         { color: #7dd3fc; }                   /* sky-300  – property name  */
+.log-kv-sep         { color: rgba(255,255,255,0.3); }     /* dim colon                 */
+.log-kv-val         { color: #e2e8f0; }                   /* near-white – value        */
+
+/* ── Section-header keywords  (e.g. "with:", "env:") ─────────────────── */
+.log-header                { color: rgba(255,255,255,0.45); }
+.log-header-text           { color: #c4b5fd; font-weight: 600; letter-spacing: 0.03em; }
 
 /* Steps accordion */
 .steps-list { padding: 8px 0; overflow-y: auto; flex: 1; }

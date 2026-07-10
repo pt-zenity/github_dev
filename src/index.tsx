@@ -2113,46 +2113,57 @@ function runDetailPage(user: any, owner: string, repo: string, run: any, jobsDat
     }
 
     // ── Log parsing helpers ──────────────────────────────────────────────────
-    // Parse a raw GitHub Actions log line into its parts
+
+    // Parse a raw GitHub Actions log line into timestamp + content
     function parseLogLine(rawLine) {
-      // GitHub Actions format: "2026-07-10T23:27:49.9596266Z ##[group]Run ..."
-      // The timestamp may have 7-digit subseconds (Windows precision)
-      const tsRx = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z ?(.*)/;
-      const m = rawLine.match(tsRx);
-      if (m) {
-        return { isoTs: m[1], timeStr: m[1].substring(11, 19), content: m[2] };
-      }
-      return { isoTs: '', timeStr: '', content: rawLine };
+      // Format: "2026-07-10T23:35:09.7839592Z <content>"
+      // Subseconds can be 1–7 digits (Windows high-res timer)
+      const m = rawLine.match(/^(\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2}))\.\d+Z (.*)/);
+      if (m) return { timeStr: m[2], content: m[3] };
+      // Fallback: no timestamp prefix (rare — treat whole line as content)
+      return { timeStr: '', content: rawLine };
     }
 
-    // Classify a stripped content line → CSS class + icon prefix
+    // How many leading spaces does the content have?
+    function leadingSpaces(s) {
+      const m = s.match(/^(\s+)/);
+      return m ? m[1].length : 0;
+    }
+
+    // Classify content → { cls, icon, cmd, indentPx }
     function classifyLine(content) {
-      const c = content;
-      const cl = c.toLowerCase();
-      // GitHub workflow commands
-      if (/^##\[error\]/i.test(c))   return { cls: 'log-error',   icon: '✖', cmd: true };
-      if (/^##\[warning\]/i.test(c)) return { cls: 'log-warn',    icon: '⚠', cmd: true };
-      if (/^##\[group\]/i.test(c))   return { cls: 'log-group',   icon: '▶', cmd: true };
-      if (/^##\[endgroup\]/i.test(c))return { cls: 'log-endgroup',icon: '◀', cmd: true };
-      if (/^##\[section\]/i.test(c)) return { cls: 'log-section', icon: '§', cmd: true };
-      if (/^##\[debug\]/i.test(c))   return { cls: 'log-debug',   icon: '·', cmd: true };
-      if (/^##\[command\]/i.test(c)) return { cls: 'log-command', icon: '$', cmd: true };
-      if (/^##\[notice\]/i.test(c))  return { cls: 'log-notice',  icon: 'ℹ', cmd: true };
-      // Content-based classification (applied only when no workflow command matched)
-      if (/error[:( ]|error$/i.test(cl) || /\bfailed?\b/i.test(cl) || /BUILD FAILURE/.test(c)) return { cls: 'log-error', icon: '', cmd: false };
-      if (/warning[:( ]|warning$/i.test(cl) || /\bwarn\b/i.test(cl))                           return { cls: 'log-warn',  icon: '', cmd: false };
-      if (/\bsuccess(fully)?\b|\bpassed\b|\bdone\b/i.test(cl))                                 return { cls: 'log-success',icon:'', cmd: false };
-      // "with:" / "env:" key-value indented blocks (lines that start with spaces + "key: value")
-      if (/^\s{2,}\S/.test(c) && /:\s/.test(c))                                                return { cls: 'log-kv',    icon: '', cmd: false };
-      return { cls: 'log-normal', icon: '', cmd: false };
-    }
+      const spaces = leadingSpaces(content);
+      const trimmed = content.trimStart();
+      const tl = trimmed.toLowerCase();
 
-    // Strip ##[cmd] prefix and return clean display text + indent level
-    function formatContent(content, isCmd) {
-      if (!isCmd) return { text: content, indent: 0 };
-      // e.g. "##[group]Run mr-smithers…"  →  "Run mr-smithers…"
-      const stripped = content.replace(/^##\[[^\]]+\]\s?/, '');
-      return { text: stripped, indent: 0 };
+      // ── GitHub workflow commands (##[…]) ──────────────────────────────────
+      if (/^##\[error\]/i.test(trimmed))    return { cls:'log-error',    icon:'✖', cmd:true,  indentPx:0 };
+      if (/^##\[warning\]/i.test(trimmed))  return { cls:'log-warn',     icon:'⚠', cmd:true,  indentPx:0 };
+      if (/^##\[group\]/i.test(trimmed))    return { cls:'log-group',    icon:'▶', cmd:true,  indentPx:0 };
+      if (/^##\[endgroup\]/i.test(trimmed)) return { cls:'log-endgroup', icon:'◀', cmd:true,  indentPx:0 };
+      if (/^##\[section\]/i.test(trimmed))  return { cls:'log-section',  icon:'§', cmd:true,  indentPx:0 };
+      if (/^##\[debug\]/i.test(trimmed))    return { cls:'log-debug',    icon:'·', cmd:true,  indentPx:0 };
+      if (/^##\[command\]/i.test(trimmed))  return { cls:'log-command',  icon:'$', cmd:true,  indentPx:0 };
+      if (/^##\[notice\]/i.test(trimmed))   return { cls:'log-notice',   icon:'ℹ', cmd:true,  indentPx:0 };
+
+      // ── Indented key: value lines (e.g. "  image: ***/vas") ──────────────
+      // These appear under "with:", "env:", "env:" blocks — indent ≥ 2 spaces
+      if (spaces >= 2 && /^[\w.-]+\s*:\s/.test(trimmed)) {
+        return { cls:'log-kv', icon:'', cmd:false, indentPx: spaces * 7 };
+      }
+
+      // ── Section-header keywords (bare words ending in colon) ─────────────
+      // e.g. "with:", "env:", "Run build-push@v4"
+      if (/^(with|env|run|uses|if|needs|outputs?|steps?|jobs?)\s*:?\s*$/i.test(trimmed)) {
+        return { cls:'log-header', icon:'', cmd:false, indentPx:0 };
+      }
+
+      // ── Content-based colours ─────────────────────────────────────────────
+      if (/error\b/i.test(tl) && !/no.?error/i.test(tl))          return { cls:'log-error',   icon:'', cmd:false, indentPx:0 };
+      if (/\b(warn(ing)?)\b/i.test(tl))                            return { cls:'log-warn',    icon:'', cmd:false, indentPx:0 };
+      if (/\b(success(fully)?|passed|complete[d]?|done)\b/i.test(tl)) return { cls:'log-success', icon:'', cmd:false, indentPx:0 };
+
+      return { cls:'log-normal', icon:'', cmd:false, indentPx:0 };
     }
 
     function renderLog(lines) {
@@ -2160,75 +2171,83 @@ function runDetailPage(user: any, owner: string, repo: string, run: any, jobsDat
       out.innerHTML = '';
       const frag = document.createDocumentFragment();
 
-      // Track indent depth for group nesting
-      let depth = 0;
+      let groupDepth = 0;   // nesting from ##[group] / ##[endgroup]
 
       lines.forEach((rawLine, i) => {
-        if (rawLine === '') {
-          // Preserve blank separator lines
+        // Skip completely empty lines — add a thin spacer instead
+        if (rawLine.trim() === '') {
           const blank = document.createElement('div');
           blank.className = 'log-line log-blank';
-          blank.innerHTML = '<span class="log-linenum">' + String(i + 1).padStart(5) + '</span>';
           frag.appendChild(blank);
           return;
         }
 
-        const { isoTs, timeStr, content } = parseLogLine(rawLine);
-        const { cls, icon, cmd } = classifyLine(content);
-        const { text } = formatContent(content, cmd);
+        const { timeStr, content } = parseLogLine(rawLine);
+        const { cls, icon, cmd, indentPx } = classifyLine(content);
 
-        // Manage group depth BEFORE rendering so endgroup de-indents this line
-        if (/^##\[endgroup\]/i.test(content)) depth = Math.max(0, depth - 1);
+        // Decrement group depth BEFORE this line renders (endgroup line itself de-indents)
+        if (/^##\[endgroup\]/i.test(content.trimStart())) groupDepth = Math.max(0, groupDepth - 1);
 
         const el = document.createElement('div');
         el.className = 'log-line ' + cls;
-        if (depth > 0) el.style.paddingLeft = (12 + depth * 14) + 'px';
         el.id = 'logline-' + i;
 
-        // ① Line number
+        // ① Line number (right-aligned gutter)
         const numEl = document.createElement('span');
         numEl.className = 'log-linenum';
         numEl.textContent = String(i + 1).padStart(5);
         el.appendChild(numEl);
 
-        // ② Timestamp  HH:MM:SS  (compact, dimmed)
+        // ② Timestamp — HH:MM:SS only (dimmed, fixed-width)
         const tsEl = document.createElement('span');
         tsEl.className = 'log-ts';
-        tsEl.textContent = timeStr ? timeStr + ' ' : '         ';
+        tsEl.textContent = timeStr || '';
         el.appendChild(tsEl);
 
-        // ③ Icon badge for workflow commands
+        // ③ Group-depth indent spacer (invisible, keeps content aligned)
+        if (groupDepth > 0 || indentPx > 0) {
+          const indent = document.createElement('span');
+          indent.className = 'log-indent';
+          indent.style.width = (groupDepth * 14 + indentPx) + 'px';
+          el.appendChild(indent);
+        }
+
+        // ④ Icon badge
         if (icon) {
           const iconEl = document.createElement('span');
           iconEl.className = 'log-icon';
-          iconEl.textContent = icon + ' ';
+          iconEl.textContent = icon;
           el.appendChild(iconEl);
         }
 
-        // ④ Main content — detect "key: value" pairs inside indented kv blocks
+        // ⑤ Content — strip ##[cmd] prefix; syntax-highlight key: value
+        const trimmedContent = cmd ? content.trimStart().replace(/^##\[[^\]]+\]\s?/, '') : content.trimStart();
         const contentEl = document.createElement('span');
         contentEl.className = 'log-content';
+
         if (cls === 'log-kv') {
-          // Syntax-highlight key: value
-          const kvMatch = text.match(/^(\s*)(\S[^:]*)(:\s?)(.*)$/);
-          if (kvMatch) {
+          // "image: ***/vas"  →  key + colon + value
+          const kv = trimmedContent.match(/^([\w.-]+)(\s*:\s?)(.*)/s);
+          if (kv) {
             contentEl.innerHTML =
-              escHtml(kvMatch[1]) +
-              '<span class="log-kv-key">' + escHtml(kvMatch[2]) + '</span>' +
-              '<span class="log-kv-sep">' + escHtml(kvMatch[3]) + '</span>' +
-              '<span class="log-kv-val">' + escHtml(kvMatch[4]) + '</span>';
+              '<span class="log-kv-key">'  + escHtml(kv[1]) + '</span>' +
+              '<span class="log-kv-sep">'  + escHtml(kv[2]) + '</span>' +
+              '<span class="log-kv-val">'  + escHtml(kv[3]) + '</span>';
           } else {
-            contentEl.textContent = text;
+            contentEl.textContent = trimmedContent;
           }
+        } else if (cls === 'log-header') {
+          // e.g. "with:" → bold section header
+          contentEl.innerHTML = '<span class="log-header-text">' + escHtml(trimmedContent) + '</span>';
         } else {
-          contentEl.textContent = text;
+          contentEl.textContent = trimmedContent;
         }
         el.appendChild(contentEl);
 
         frag.appendChild(el);
 
-        // Increment depth AFTER rendering the group header line
-        if (/^##\[group\]/i.test(content)) depth++;
+        // Increment group depth AFTER the group header line
+        if (/^##\[group\]/i.test(content.trimStart())) groupDepth++;
       });
 
       out.appendChild(frag);
