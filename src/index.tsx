@@ -74,14 +74,25 @@ app.get('/', (c) => c.redirect('/dashboard'))
 app.get('/dashboard', async (c) => {
   const token = getToken(c)
   if (!token) return c.redirect('/login')
-  
+
   const userCookie = getCookie(c, 'gh_user')
   const user = userCookie ? JSON.parse(userCookie) : {}
-  
-  const { data: repos } = await githubApi(token, '/user/repos?sort=updated&per_page=50&type=all')
-  const { data: userData } = await githubApi(token, '/user')
-  
-  return c.html(dashboardPage(user, Array.isArray(repos) ? repos : [], userData))
+
+  // Fetch ALL repos by paginating (GitHub caps per_page at 100)
+  const [userResult, ...pageResults] = await Promise.all([
+    githubApi(token, '/user'),
+    githubApi(token, '/user/repos?sort=updated&per_page=100&page=1&type=all'),
+    githubApi(token, '/user/repos?sort=updated&per_page=100&page=2&type=all'),
+    githubApi(token, '/user/repos?sort=updated&per_page=100&page=3&type=all'),
+  ])
+
+  const userData = userResult.data
+  const allRepos: any[] = []
+  for (const r of pageResults) {
+    if (Array.isArray(r.data)) allRepos.push(...r.data)
+  }
+
+  return c.html(dashboardPage(user, allRepos, userData))
 })
 
 // ==================== REPOSITORY ROUTES ====================
@@ -832,86 +843,141 @@ function loginPage(error?: string) {
 }
 
 function dashboardPage(user: any, repos: any[], userData: any) {
-  const totalRepos = repos.length
-  const privateRepos = repos.filter(r => r.private).length
-  const publicRepos = totalRepos - privateRepos
-  const totalStars = repos.reduce((sum, r) => sum + (r.stargazers_count || 0), 0)
+  const totalRepos  = repos.length
+  const publicRepos = repos.filter(r => !r.private && !r.fork && !r.archived).length
+  const privateRepos= repos.filter(r =>  r.private).length
+  const forkRepos   = repos.filter(r =>  r.fork).length
+  const archivedRepos=repos.filter(r =>  r.archived).length
+  const totalStars  = repos.reduce((s, r) => s + (r.stargazers_count || 0), 0)
 
-  const repoCards = repos.map(repo => `
-    <a href="/repo/${repo.owner.login}/${repo.name}" class="repo-card glass-card hover-lift">
+  // Language colour map (subset — enough for the most common languages)
+  const langColors: Record<string, string> = {
+    JavaScript:'#f1e05a', TypeScript:'#3178c6', Python:'#3572A5', Go:'#00ADD8',
+    Rust:'#dea584', Java:'#b07219', 'C++':'#f34b7d', C:'#555555', 'C#':'#178600',
+    Ruby:'#701516', PHP:'#4F5D95', Swift:'#ffac45', Kotlin:'#A97BFF',
+    Shell:'#89e051', HTML:'#e34c26', CSS:'#563d7c', Dart:'#00B4AB',
+    Scala:'#c22d40', Vue:'#41b883', YAML:'#cb171e', Dockerfile:'#384d54'
+  }
+
+  const repoCards = repos.map(repo => {
+    // Determine visibility category for data attribute
+    const vis = repo.private ? 'private' : (repo.fork ? 'fork' : (repo.archived ? 'archived' : 'public'))
+
+    // Badge HTML
+    const badgeHtml = repo.archived
+      ? '<span class="badge-archived">📦 Archived</span>'
+      : repo.fork
+        ? '<span class="badge-fork">🍴 Fork</span>'
+        : repo.private
+          ? '<span class="badge-private">🔒 Private</span>'
+          : '<span class="badge-public">🌐 Public</span>'
+
+    const langColor = repo.language ? (langColors[repo.language] || '#8b8b8b') : ''
+    const langHtml  = repo.language
+      ? `<span class="repo-lang"><span class="lang-dot" style="background:${langColor}"></span>${escapeHtml(repo.language)}</span>`
+      : ''
+
+    // Extra badges row (topics, template)
+    const topicBadges = (repo.topics || []).slice(0, 3).map((t: string) =>
+      `<span class="badge-topic">${escapeHtml(t)}</span>`
+    ).join('')
+
+    return `
+    <a href="/repo/${repo.owner.login}/${repo.name}" class="repo-card glass-card hover-lift"
+       data-vis="${vis}"
+       data-name="${escapeHtml(repo.name.toLowerCase())}"
+       data-desc="${escapeHtml((repo.description || '').toLowerCase())}">
       <div class="repo-card-header">
         <div class="repo-card-name">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
-          <span>${repo.name}</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;opacity:.7"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+          <span>${escapeHtml(repo.name)}</span>
         </div>
-        <span class="${repo.private ? 'badge-private' : 'badge-public'}">${repo.private ? 'Private' : 'Public'}</span>
+        <div class="repo-badges">${badgeHtml}</div>
       </div>
-      ${repo.description ? `<p class="repo-desc">${repo.description}</p>` : '<p class="repo-desc text-white/30 italic">No description</p>'}
+      <p class="repo-desc">${repo.description ? escapeHtml(repo.description) : '<span style="opacity:.3;font-style:italic">No description</span>'}</p>
+      ${topicBadges ? `<div class="repo-topics">${topicBadges}</div>` : ''}
       <div class="repo-meta">
-        ${repo.language ? `<span class="repo-lang"><span class="lang-dot"></span>${repo.language}</span>` : ''}
+        ${langHtml}
         <span class="repo-stat">⭐ ${repo.stargazers_count}</span>
         <span class="repo-stat">🍴 ${repo.forks_count}</span>
-        <span class="repo-stat">🔄 ${timeAgo(repo.updated_at)}</span>
+        <span class="repo-stat" title="${repo.updated_at}">🔄 ${timeAgo(repo.updated_at)}</span>
       </div>
-    </a>
-  `).join('')
+    </a>`
+  }).join('')
 
   const content = `
     <div class="dashboard-header">
       <div class="user-profile glass-card">
         <img src="${userData?.avatar_url || ''}" class="user-avatar" />
         <div class="user-info">
-          <h2 class="user-name">${userData?.name || userData?.login || 'User'}</h2>
-          <p class="user-login">@${userData?.login}</p>
-          ${userData?.bio ? `<p class="user-bio">${userData.bio}</p>` : ''}
+          <h2 class="user-name">${escapeHtml(userData?.name || userData?.login || 'User')}</h2>
+          <p class="user-login">@${escapeHtml(userData?.login || '')}</p>
+          ${userData?.bio ? `<p class="user-bio">${escapeHtml(userData.bio)}</p>` : ''}
           <div class="user-stats">
-            <span>👥 ${userData?.followers} followers</span>
-            <span>👤 ${userData?.following} following</span>
-            <span>📦 ${userData?.public_repos} public repos</span>
+            <span>👥 ${userData?.followers ?? 0} followers</span>
+            <span>👤 ${userData?.following ?? 0} following</span>
+            <span>📦 ${userData?.public_repos ?? 0} public repos</span>
           </div>
         </div>
       </div>
       <div class="stats-grid">
-        <div class="stat-card glass-card">
-          <div class="stat-num">${totalRepos}</div>
-          <div class="stat-label">Total Repos</div>
-        </div>
-        <div class="stat-card glass-card">
-          <div class="stat-num">${publicRepos}</div>
-          <div class="stat-label">Public</div>
-        </div>
-        <div class="stat-card glass-card">
-          <div class="stat-num">${privateRepos}</div>
-          <div class="stat-label">Private</div>
-        </div>
-        <div class="stat-card glass-card">
-          <div class="stat-num">${totalStars}</div>
-          <div class="stat-label">Total Stars</div>
-        </div>
+        <div class="stat-card glass-card"><div class="stat-num">${totalRepos}</div><div class="stat-label">Total Repos</div></div>
+        <div class="stat-card glass-card"><div class="stat-num">${publicRepos}</div><div class="stat-label">Public</div></div>
+        <div class="stat-card glass-card"><div class="stat-num">${privateRepos}</div><div class="stat-label">Private</div></div>
+        <div class="stat-card glass-card"><div class="stat-num">${forkRepos}</div><div class="stat-label">Forks</div></div>
+        <div class="stat-card glass-card"><div class="stat-num">${archivedRepos}</div><div class="stat-label">Archived</div></div>
+        <div class="stat-card glass-card"><div class="stat-num">${totalStars}</div><div class="stat-label">Stars</div></div>
       </div>
     </div>
-    
-    <div class="section-header">
-      <h3 class="section-title">Repositories</h3>
-      <input type="text" id="repoSearch" placeholder="🔍 Filter repositories..." class="search-input" oninput="filterRepos(this.value)">
+
+    <div class="section-header" style="flex-wrap:wrap;gap:10px;">
+      <h3 class="section-title">Repositories <span id="repoCount" class="repo-count-badge">${totalRepos}</span></h3>
+      <div class="repo-filter-row">
+        <div class="repo-filter-tabs">
+          <button class="filter-tab active" data-filter="all"     onclick="setFilter('all')">All <span class="tab-count">${totalRepos}</span></button>
+          <button class="filter-tab"        data-filter="public"  onclick="setFilter('public')">🌐 Public <span class="tab-count">${publicRepos}</span></button>
+          <button class="filter-tab"        data-filter="private" onclick="setFilter('private')">🔒 Private <span class="tab-count">${privateRepos}</span></button>
+          <button class="filter-tab"        data-filter="fork"    onclick="setFilter('fork')">🍴 Fork <span class="tab-count">${forkRepos}</span></button>
+          ${archivedRepos > 0 ? `<button class="filter-tab" data-filter="archived" onclick="setFilter('archived')">📦 Archived <span class="tab-count">${archivedRepos}</span></button>` : ''}
+        </div>
+        <input type="text" id="repoSearch" placeholder="🔍 Search..." class="search-input" oninput="applyFilters()">
+      </div>
     </div>
+
+    <div id="noReposMsg" class="hidden" style="text-align:center;padding:48px 0;color:rgba(255,255,255,0.3);">No repositories match this filter.</div>
     <div class="repo-grid" id="repoGrid">
       ${repoCards}
     </div>
-    
+
     <script>
-    function filterRepos(q) {
+    let currentFilter = 'all';
+
+    function setFilter(f) {
+      currentFilter = f;
+      document.querySelectorAll('.filter-tab').forEach(t => t.classList.toggle('active', t.dataset.filter === f));
+      applyFilters();
+    }
+
+    function applyFilters() {
+      const q = (document.getElementById('repoSearch').value || '').toLowerCase().trim();
       const cards = document.querySelectorAll('#repoGrid .repo-card');
-      const query = q.toLowerCase();
+      let visible = 0;
       cards.forEach(card => {
-        const name = card.querySelector('.repo-card-name span').textContent.toLowerCase();
-        const desc = card.querySelector('.repo-desc')?.textContent.toLowerCase() || '';
-        card.style.display = name.includes(query) || desc.includes(query) ? '' : 'none';
+        const vis  = card.dataset.vis;
+        const name = card.dataset.name;
+        const desc = card.dataset.desc;
+        const matchFilter = currentFilter === 'all' || vis === currentFilter;
+        const matchSearch = !q || name.includes(q) || desc.includes(q);
+        const show = matchFilter && matchSearch;
+        card.style.display = show ? '' : 'none';
+        if (show) visible++;
       });
+      document.getElementById('repoCount').textContent = visible;
+      document.getElementById('noReposMsg').classList.toggle('hidden', visible > 0);
     }
     </script>
   `
-  
+
   return glassLayout('Dashboard', user, content)
 }
 
