@@ -672,13 +672,90 @@ app.get('/repo/:owner/:repo/settings/collaborators', async (c) => {
   const { owner, repo } = c.req.param()
   const userCookie = getCookie(c, 'gh_user')
   const user = userCookie ? JSON.parse(userCookie) : {}
-  
-  const [collabsRes, repoRes] = await Promise.all([
-    githubApi(token, `/repos/${owner}/${repo}/collaborators`),
-    githubApi(token, `/repos/${owner}/${repo}`)
+
+  const [collabsRes, repoRes, invitesRes] = await Promise.all([
+    githubApi(token, `/repos/${owner}/${repo}/collaborators?per_page=100&affiliation=all`),
+    githubApi(token, `/repos/${owner}/${repo}`),
+    githubApi(token, `/repos/${owner}/${repo}/invitations?per_page=50`)
   ])
-  
-  return c.html(collaboratorsPage(user, owner, repo, collabsRes.data, repoRes.data))
+
+  return c.html(collaboratorsPage(user, owner, repo, collabsRes.data, repoRes.data, invitesRes.data))
+})
+
+// API: Invite / add collaborator (PUT — idempotent)
+app.put('/repo/:owner/:repo/settings/collaborators/:username', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, username } = c.req.param()
+  const body = await c.req.json().catch(() => ({})) as any
+  const permission = body.permission || 'push' // pull | triage | push | maintain | admin
+
+  const { status, data } = await githubApi(token, `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(username)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ permission })
+  })
+
+  if (status === 201) return c.json({ success: true, status: 'invited', data })
+  if (status === 204) return c.json({ success: true, status: 'already_collab' })
+  return c.json({ error: data?.message || 'Failed', detail: data }, status as any)
+})
+
+// API: Remove collaborator
+app.delete('/repo/:owner/:repo/settings/collaborators/:username', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, username } = c.req.param()
+
+  const { status, data } = await githubApi(token, `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(username)}`, {
+    method: 'DELETE'
+  })
+
+  if (status === 204) return c.json({ success: true })
+  return c.json({ error: data?.message || 'Failed' }, status as any)
+})
+
+// API: Cancel pending invitation
+app.delete('/repo/:owner/:repo/settings/invitations/:invitationId', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, invitationId } = c.req.param()
+
+  const { status, data } = await githubApi(token, `/repos/${owner}/${repo}/invitations/${invitationId}`, {
+    method: 'DELETE'
+  })
+
+  if (status === 204) return c.json({ success: true })
+  return c.json({ error: data?.message || 'Failed' }, status as any)
+})
+
+// API: Update invitation permission
+app.patch('/repo/:owner/:repo/settings/invitations/:invitationId', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, invitationId } = c.req.param()
+  const body = await c.req.json().catch(() => ({})) as any
+
+  const { status, data } = await githubApi(token, `/repos/${owner}/${repo}/invitations/${invitationId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ permissions: body.permission || 'push' })
+  })
+
+  if (status === 200) return c.json({ success: true, data })
+  return c.json({ error: data?.message || 'Failed' }, status as any)
+})
+
+// API: Search GitHub user (for autocomplete)
+app.get('/api/users/search', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const q = c.req.query('q') || ''
+  if (!q || q.length < 2) return c.json({ items: [] })
+
+  const { status, data } = await githubApi(token, `/search/users?q=${encodeURIComponent(q)}&per_page=8`)
+  if (status === 200) return c.json({ items: data.items || [] })
+  return c.json({ items: [] })
 })
 
 // Deploy Keys
@@ -2871,36 +2948,298 @@ function webhooksPage(user: any, owner: string, repo: string, webhooks: any[], r
   return glassLayout(`Webhooks - ${repo}`, user, content)
 }
 
-function collaboratorsPage(user: any, owner: string, repo: string, collabs: any[], repoData: any) {
-  const isError = !Array.isArray(collabs)
-  const items = isError ? [] : collabs
+function collaboratorsPage(user: any, owner: string, repo: string, collabs: any[], repoData: any, invites: any[]) {
+  const isError   = !Array.isArray(collabs)
+  const items     = isError ? [] : collabs
+  const pendingInvites = Array.isArray(invites) ? invites : []
+
+  const permLabels: Record<string, string> = {
+    pull:     'Read',
+    triage:   'Triage',
+    push:     'Write',
+    maintain: 'Maintain',
+    admin:    'Admin'
+  }
+  const permColors: Record<string, string> = {
+    pull: 'badge-neutral', triage: 'badge-neutral',
+    push: 'badge-public',  maintain: 'badge-fork', admin: 'badge-private'
+  }
+
+  function permBadge(perm: string) {
+    return `<span class="${permColors[perm] || 'badge-neutral'}">${permLabels[perm] || perm}</span>`
+  }
+
+  const collabCards = items.map((c: any) => {
+    const perm = c.role_name || (c.permissions
+      ? (c.permissions.admin ? 'admin' : c.permissions.maintain ? 'maintain' : c.permissions.push ? 'push' : c.permissions.triage ? 'triage' : 'pull')
+      : 'push')
+    return `
+    <div class="collab-card glass-card" id="collab-${c.login}">
+      <div class="collab-avatar-wrap">
+        <img src="${c.avatar_url}" class="collab-avatar" />
+        <span class="collab-type-dot ${c.type === 'Organization' ? 'dot-org' : 'dot-user'}" title="${c.type}"></span>
+      </div>
+      <div class="collab-info">
+        <div class="collab-login">${escapeHtml(c.login)}</div>
+        <div class="collab-type">${c.type || 'User'}</div>
+        <div class="collab-perm-row">
+          ${permBadge(perm)}
+          <select class="perm-select" onchange="updatePermission('${escapeHtml(c.login)}', this.value)">
+            <option value="pull"     ${perm==='pull'?'selected':''}>Read</option>
+            <option value="triage"   ${perm==='triage'?'selected':''}>Triage</option>
+            <option value="push"     ${perm==='push'?'selected':''}>Write</option>
+            <option value="maintain" ${perm==='maintain'?'selected':''}>Maintain</option>
+            <option value="admin"    ${perm==='admin'?'selected':''}>Admin</option>
+          </select>
+        </div>
+      </div>
+      <div class="collab-actions">
+        <a href="https://github.com/${escapeHtml(c.login)}" target="_blank" class="glass-btn-sm">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+          Profile
+        </a>
+        <button class="glass-btn-sm btn-danger" onclick="removeCollab('${escapeHtml(c.login)}')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          Remove
+        </button>
+      </div>
+    </div>`
+  }).join('')
+
+  const inviteCards = pendingInvites.map((inv: any) => `
+    <div class="collab-card glass-card invite-pending" id="invite-${inv.id}">
+      <div class="collab-avatar-wrap">
+        <img src="${inv.invitee?.avatar_url || ''}" class="collab-avatar" style="opacity:.6" />
+        <span class="collab-type-dot dot-pending" title="Pending"></span>
+      </div>
+      <div class="collab-info">
+        <div class="collab-login">${escapeHtml(inv.invitee?.login || '—')}</div>
+        <div class="collab-type" style="color:#fde047">⏳ Pending invitation</div>
+        <div class="collab-perm-row">${permBadge(inv.permissions || 'push')}</div>
+      </div>
+      <div class="collab-actions">
+        <a href="https://github.com/${escapeHtml(inv.invitee?.login || '')}" target="_blank" class="glass-btn-sm">Profile</a>
+        <button class="glass-btn-sm btn-danger" onclick="cancelInvite(${inv.id}, '${escapeHtml(inv.invitee?.login || '')}')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          Cancel
+        </button>
+      </div>
+    </div>`
+  ).join('')
 
   const content = `
     ${repoNav(owner, repo, 'collaborators', repoData)}
-    <div class="section-header">
-      <h3 class="section-title">Collaborators <span class="count-badge">${items.length}</span></h3>
-    </div>
-    ${isError ? '<div class="alert-error">Gagal memuat collaborators (Perlu akses admin)</div>' : items.length === 0 ? '<div class="empty-state">Tidak ada collaborators</div>' : `
-      <div class="grid grid-2 gap-3">
-        ${items.map((c: any) => `
-          <div class="glass-card hover-lift">
-            <div class="p-4 flex items-center gap-3">
-              <img src="${c.avatar_url}" class="w-12 h-12 rounded-full border-2 border-white/20" />
-              <div class="flex-1">
-                <div class="text-white font-medium">${c.login}</div>
-                <div class="text-white/40 text-sm">${c.type}</div>
-                <div class="flex gap-1 mt-1 flex-wrap">
-                  ${c.permissions ? Object.entries(c.permissions).filter(([,v]) => v).map(([k]) => `<span class="badge-neutral text-xs">${k}</span>`).join('') : ''}
-                </div>
-              </div>
-              <a href="https://github.com/${c.login}" target="_blank" class="glass-btn-sm">Profile</a>
-            </div>
-          </div>
-        `).join('')}
+
+    <!-- Toast -->
+    <div id="collab-toast" class="toast hidden"></div>
+
+    <!-- ── Invite Form ─────────────────────────────────────────────────── -->
+    <div class="invite-box glass-card">
+      <h3 class="invite-title">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+        Invite Collaborator
+      </h3>
+      <p class="invite-hint">Cari username GitHub dan tentukan level akses. Mereka akan menerima email undangan.</p>
+
+      <div class="invite-form-row">
+        <!-- Username search -->
+        <div class="invite-search-wrap" style="position:relative;flex:1">
+          <input type="text" id="inviteInput" class="invite-input" placeholder="Cari username GitHub…"
+            autocomplete="off"
+            oninput="searchUsers(this.value)"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();doInvite()}" />
+          <div id="userSuggest" class="user-suggest hidden"></div>
+        </div>
+
+        <!-- Permission selector -->
+        <select id="invitePermission" class="invite-perm-select">
+          <option value="pull">Read — dapat clone & pull</option>
+          <option value="triage">Triage — kelola issues/PR</option>
+          <option value="push" selected>Write — push code</option>
+          <option value="maintain">Maintain — kelola repo</option>
+          <option value="admin">Admin — full access</option>
+        </select>
+
+        <button class="glass-btn invite-btn" onclick="doInvite()" id="inviteBtn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Invite
+        </button>
       </div>
-    `}
+
+      <!-- Permission description -->
+      <div class="perm-legend">
+        <span class="perm-pill perm-read">Read</span> clone & lihat kode &nbsp;|&nbsp;
+        <span class="perm-pill perm-triage">Triage</span> kelola issues &nbsp;|&nbsp;
+        <span class="perm-pill perm-write">Write</span> push &amp; merge &nbsp;|&nbsp;
+        <span class="perm-pill perm-maintain">Maintain</span> kelola repo &nbsp;|&nbsp;
+        <span class="perm-pill perm-admin">Admin</span> full control
+      </div>
+    </div>
+
+    <!-- ── Pending Invitations ─────────────────────────────────────────── -->
+    ${pendingInvites.length > 0 ? `
+    <div class="section-header" style="margin-top:24px">
+      <h3 class="section-title">
+        Pending Invitations
+        <span class="count-badge" style="background:rgba(234,179,8,.15);color:#fde047;border-color:rgba(234,179,8,.3)">${pendingInvites.length}</span>
+      </h3>
+    </div>
+    <div class="collab-grid" id="invitesGrid">${inviteCards}</div>
+    ` : ''}
+
+    <!-- ── Active Collaborators ────────────────────────────────────────── -->
+    <div class="section-header" style="margin-top:${pendingInvites.length ? '24px' : '24px'}">
+      <h3 class="section-title">
+        Collaborators
+        <span class="count-badge">${items.length}</span>
+      </h3>
+      <input type="text" class="search-input" placeholder="🔍 Filter…" oninput="filterCollabs(this.value)" style="width:180px">
+    </div>
+
+    ${isError
+      ? `<div class="alert-error">⚠ Gagal memuat collaborators — token perlu scope <code>repo</code> dan akses admin ke repo ini.</div>`
+      : items.length === 0
+        ? `<div class="empty-state" style="padding:40px 0">
+             <div style="font-size:40px;margin-bottom:12px">👥</div>
+             <div style="color:rgba(255,255,255,0.5)">Belum ada collaborator. Gunakan form di atas untuk mengundang.</div>
+           </div>`
+        : `<div class="collab-grid" id="collabGrid">${collabCards}</div>`
+    }
+
+    <script>
+    const OWNER = '${escapeHtml(owner)}', REPO = '${escapeHtml(repo)}';
+    let suggestTimeout = null;
+
+    // ── Toast helper ─────────────────────────────────────────────────────
+    function showToast(msg, type='success') {
+      const t = document.getElementById('collab-toast');
+      t.textContent = msg;
+      t.className = 'toast ' + (type === 'success' ? 'toast-success' : 'toast-error');
+      t.classList.remove('hidden');
+      setTimeout(() => t.classList.add('hidden'), 4000);
+    }
+
+    // ── User autocomplete ─────────────────────────────────────────────────
+    function searchUsers(q) {
+      clearTimeout(suggestTimeout);
+      const box = document.getElementById('userSuggest');
+      if (!q || q.length < 2) { box.classList.add('hidden'); return; }
+      suggestTimeout = setTimeout(async () => {
+        try {
+          const res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
+          const data = await res.json();
+          if (!data.items || data.items.length === 0) { box.classList.add('hidden'); return; }
+          box.innerHTML = data.items.map(u => \`
+            <div class="suggest-item" onclick="selectUser('\${u.login}')">
+              <img src="\${u.avatar_url}" class="suggest-avatar" />
+              <div>
+                <div class="suggest-login">\${u.login}</div>
+                <div class="suggest-type">\${u.type}</div>
+              </div>
+            </div>
+          \`).join('');
+          box.classList.remove('hidden');
+        } catch(e) { box.classList.add('hidden'); }
+      }, 300);
+    }
+
+    function selectUser(login) {
+      document.getElementById('inviteInput').value = login;
+      document.getElementById('userSuggest').classList.add('hidden');
+    }
+
+    // Close suggestions on outside click
+    document.addEventListener('click', e => {
+      if (!e.target.closest('.invite-search-wrap'))
+        document.getElementById('userSuggest').classList.add('hidden');
+    });
+
+    // ── Invite collaborator ───────────────────────────────────────────────
+    async function doInvite() {
+      const username   = document.getElementById('inviteInput').value.trim();
+      const permission = document.getElementById('invitePermission').value;
+      const btn = document.getElementById('inviteBtn');
+      if (!username) { showToast('Masukkan username GitHub terlebih dahulu', 'error'); return; }
+
+      btn.disabled = true; btn.textContent = 'Sending…';
+      try {
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/settings/collaborators/\${encodeURIComponent(username)}\`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ permission })
+        });
+        const d = await res.json();
+        if (d.success) {
+          if (d.status === 'already_collab') {
+            showToast(\`✓ \${username} sudah menjadi collaborator\`);
+          } else {
+            showToast(\`✉ Undangan dikirim ke \${username}!\`);
+            document.getElementById('inviteInput').value = '';
+            setTimeout(() => location.reload(), 1500);
+          }
+        } else {
+          showToast('Gagal: ' + (d.error || 'unknown error'), 'error');
+        }
+      } catch(e) {
+        showToast('Network error: ' + e.message, 'error');
+      } finally {
+        btn.disabled = false; btn.textContent = 'Invite';
+        btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> Invite';
+      }
+    }
+
+    // ── Update permission ─────────────────────────────────────────────────
+    async function updatePermission(username, permission) {
+      try {
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/settings/collaborators/\${encodeURIComponent(username)}\`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ permission })
+        });
+        const d = await res.json();
+        if (d.success) showToast(\`✓ Permission \${username} diperbarui\`);
+        else showToast('Gagal: ' + (d.error || ''), 'error');
+      } catch(e) { showToast('Network error', 'error'); }
+    }
+
+    // ── Remove collaborator ───────────────────────────────────────────────
+    async function removeCollab(username) {
+      if (!confirm(\`Hapus \${username} dari collaborator repo ini?\`)) return;
+      try {
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/settings/collaborators/\${encodeURIComponent(username)}\`, { method: 'DELETE' });
+        const d = await res.json();
+        if (d.success) {
+          showToast(\`✓ \${username} dihapus dari collaborator\`);
+          document.getElementById('collab-' + username)?.remove();
+        } else showToast('Gagal: ' + (d.error || ''), 'error');
+      } catch(e) { showToast('Network error', 'error'); }
+    }
+
+    // ── Cancel invitation ─────────────────────────────────────────────────
+    async function cancelInvite(invId, login) {
+      if (!confirm(\`Batalkan undangan untuk \${login}?\`)) return;
+      try {
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/settings/invitations/\${invId}\`, { method: 'DELETE' });
+        const d = await res.json();
+        if (d.success) {
+          showToast(\`✓ Undangan \${login} dibatalkan\`);
+          document.getElementById('invite-' + invId)?.remove();
+        } else showToast('Gagal: ' + (d.error || ''), 'error');
+      } catch(e) { showToast('Network error', 'error'); }
+    }
+
+    // ── Filter collabs ────────────────────────────────────────────────────
+    function filterCollabs(q) {
+      const ql = q.toLowerCase();
+      document.querySelectorAll('#collabGrid .collab-card').forEach(el => {
+        const login = el.querySelector('.collab-login')?.textContent.toLowerCase() || '';
+        el.style.display = !q || login.includes(ql) ? '' : 'none';
+      });
+    }
+    </script>
   `
-  return glassLayout(`Collaborators - ${repo}`, user, content)
+
+  return glassLayout(`Collaborators — ${repo}`, user, content)
 }
 
 function deployKeysPage(user: any, owner: string, repo: string, keys: any[], repoData: any) {
