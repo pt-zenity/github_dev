@@ -89,18 +89,21 @@ app.get('/repo/:owner/:repo', async (c) => {
   if (!token) return c.redirect('/login')
   const { owner, repo } = c.req.param()
   const path = c.req.query('path') || ''
-  const branch = c.req.query('branch') || 'main'
   const userCookie = getCookie(c, 'gh_user')
   const user = userCookie ? JSON.parse(userCookie) : {}
 
-  const treePath = path ? `/repos/${owner}/${repo}/contents/${path}?ref=${branch}` : `/repos/${owner}/${repo}/contents?ref=${branch}`
-  const [contentsRes, repoRes, branchesRes] = await Promise.all([
+  // Fetch repo info first to get real default_branch
+  const repoRes = await githubApi(token, `/repos/${owner}/${repo}`)
+  const repoData = repoRes.data
+  const branch = c.req.query('branch') || repoData?.default_branch || 'main'
+
+  const treePath = path ? `/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}` : `/repos/${owner}/${repo}/contents?ref=${encodeURIComponent(branch)}`
+  const [contentsRes, branchesRes] = await Promise.all([
     githubApi(token, treePath),
-    githubApi(token, `/repos/${owner}/${repo}`),
-    githubApi(token, `/repos/${owner}/${repo}/branches?per_page=30`)
+    githubApi(token, `/repos/${owner}/${repo}/branches?per_page=100`)
   ])
   
-  return c.html(codePage(user, owner, repo, contentsRes.data, repoRes.data, branchesRes.data, path, branch))
+  return c.html(codePage(user, owner, repo, contentsRes.data, repoData, branchesRes.data, path, branch))
 })
 
 // File content
@@ -109,16 +112,16 @@ app.get('/repo/:owner/:repo/blob', async (c) => {
   if (!token) return c.redirect('/login')
   const { owner, repo } = c.req.param()
   const path = c.req.query('path') || ''
-  const branch = c.req.query('branch') || 'main'
   const userCookie = getCookie(c, 'gh_user')
   const user = userCookie ? JSON.parse(userCookie) : {}
   
-  const [fileRes, repoRes] = await Promise.all([
-    githubApi(token, `/repos/${owner}/${repo}/contents/${path}?ref=${branch}`),
-    githubApi(token, `/repos/${owner}/${repo}`)
-  ])
+  const repoRes = await githubApi(token, `/repos/${owner}/${repo}`)
+  const repoData = repoRes.data
+  const branch = c.req.query('branch') || repoData?.default_branch || 'main'
+
+  const fileRes = await githubApi(token, `/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}`)
   
-  return c.html(filePage(user, owner, repo, fileRes.data, repoRes.data, path, branch))
+  return c.html(filePage(user, owner, repo, fileRes.data, repoData, path, branch))
 })
 
 // Commits
@@ -126,18 +129,18 @@ app.get('/repo/:owner/:repo/commits', async (c) => {
   const token = getToken(c)
   if (!token) return c.redirect('/login')
   const { owner, repo } = c.req.param()
-  const branch = c.req.query('branch') || ''
   const page = parseInt(c.req.query('page') || '1')
   const userCookie = getCookie(c, 'gh_user')
   const user = userCookie ? JSON.parse(userCookie) : {}
   
-  const branchParam = branch ? `&sha=${branch}` : ''
-  const [commitsRes, repoRes] = await Promise.all([
-    githubApi(token, `/repos/${owner}/${repo}/commits?per_page=20&page=${page}${branchParam}`),
-    githubApi(token, `/repos/${owner}/${repo}`)
-  ])
+  const repoRes = await githubApi(token, `/repos/${owner}/${repo}`)
+  const repoData = repoRes.data
+  const branch = c.req.query('branch') || repoData?.default_branch || 'main'
+
+  const branchParam = branch ? `&sha=${encodeURIComponent(branch)}` : ''
+  const commitsRes = await githubApi(token, `/repos/${owner}/${repo}/commits?per_page=20&page=${page}${branchParam}`)
   
-  return c.html(commitsPage(user, owner, repo, commitsRes.data, repoRes.data, page, branch))
+  return c.html(commitsPage(user, owner, repo, commitsRes.data, repoData, page, branch))
 })
 
 // Single Commit
@@ -666,6 +669,7 @@ function dashboardPage(user: any, repos: any[], userData: any) {
 
 function codePage(user: any, owner: string, repo: string, contents: any, repoData: any, branches: any[], path: string, branch: string) {
   const isError = !Array.isArray(contents)
+  const errorMsg = isError ? (contents?.message || 'Tidak dapat memuat konten repository') : ''
   const files = isError ? [] : contents.sort((a: any, b: any) => {
     if (a.type === 'dir' && b.type !== 'dir') return -1
     if (a.type !== 'dir' && b.type === 'dir') return 1
@@ -673,13 +677,16 @@ function codePage(user: any, owner: string, repo: string, contents: any, repoDat
   })
 
   const breadcrumb = path ? path.split('/').map((part, i, arr) => {
-    const href = `/repo/${owner}/${repo}?path=${arr.slice(0, i + 1).join('/')}&branch=${branch}`
-    return `<a href="${href}" class="breadcrumb-link">${part}</a>`
+    const partPath = arr.slice(0, i + 1).join('/')
+    const href = `/repo/${owner}/${repo}?path=${encodeURIComponent(partPath)}&branch=${encodeURIComponent(branch)}`
+    return `<a href="${href}" class="breadcrumb-link">${escapeHtml(part)}</a>`
   }).join('<span class="text-white/30"> / </span>') : ''
 
   const branchOptions = Array.isArray(branches) ? branches.map(b => 
-    `<option value="${b.name}" ${b.name === branch ? 'selected' : ''}>${b.name}</option>`
-  ).join('') : ''
+    `<option value="${escapeHtml(b.name)}" ${b.name === branch ? 'selected' : ''}>${escapeHtml(b.name)}</option>`
+  ).join('') : `<option value="${escapeHtml(branch)}" selected>${escapeHtml(branch)}</option>`
+
+  const defaultBranch = repoData?.default_branch || branch
 
   const fileRows = files.map((f: any) => `
     <tr class="file-row">
@@ -691,8 +698,8 @@ function codePage(user: any, owner: string, repo: string, contents: any, repoDat
       </td>
       <td class="file-name-cell">
         ${f.type === 'dir' ? 
-          `<a href="/repo/${owner}/${repo}?path=${f.path}&branch=${branch}" class="file-link dir-link">${f.name}</a>` :
-          `<a href="/repo/${owner}/${repo}/blob?path=${f.path}&branch=${branch}" class="file-link">${f.name}</a>`
+          `<a href="/repo/${owner}/${repo}?path=${encodeURIComponent(f.path)}&branch=${encodeURIComponent(branch)}" class="file-link dir-link">${escapeHtml(f.name)}</a>` :
+          `<a href="/repo/${owner}/${repo}/blob?path=${encodeURIComponent(f.path)}&branch=${encodeURIComponent(branch)}" class="file-link">${escapeHtml(f.name)}</a>`
         }
       </td>
       <td class="file-size-cell">${f.type === 'file' ? formatBytes(f.size) : ''}</td>
@@ -704,23 +711,38 @@ function codePage(user: any, owner: string, repo: string, contents: any, repoDat
     <div class="glass-card">
       <div class="code-toolbar">
         <div class="breadcrumb">
-          <a href="/repo/${owner}/${repo}?branch=${branch}" class="breadcrumb-link">root</a>
+          <a href="/repo/${owner}/${repo}?branch=${encodeURIComponent(branch)}" class="breadcrumb-link">root</a>
           ${breadcrumb ? '<span class="text-white/30"> / </span>' + breadcrumb : ''}
         </div>
         <div class="toolbar-right">
-          <select class="glass-select" onchange="window.location='/repo/${owner}/${repo}?branch='+this.value">
+          <select class="glass-select" onchange="window.location='/repo/${owner}/${repo}?branch='+encodeURIComponent(this.value)${path ? `+'&path=${encodeURIComponent(path)}'` : ''}">
             ${branchOptions}
           </select>
         </div>
       </div>
-      ${isError ? '<div class="alert-error p-4">Tidak dapat memuat konten repository</div>' : 
-        files.length === 0 ? '<div class="empty-state">Repository kosong</div>' : `
+      ${isError
+        ? `<div class="alert-error p-4">
+            <strong>Gagal memuat konten:</strong> ${escapeHtml(errorMsg)}
+            ${contents?.documentation_url ? `<br><a href="${contents.documentation_url}" target="_blank" class="link text-xs">${contents.documentation_url}</a>` : ''}
+            <br><small class="text-white/50">Branch: <code>${escapeHtml(branch)}</code> | Default: <code>${escapeHtml(defaultBranch)}</code></small>
+           </div>`
+        : files.length === 0 ? '<div class="empty-state">Repository kosong atau branch belum memiliki file</div>' : `
         <table class="file-table">
           <tbody>${fileRows}</tbody>
         </table>
       `}
     </div>
-    ${repoData?.description ? `<div class="glass-card mt-3 p-4 text-white/70 text-sm">${repoData.description}</div>` : ''}
+    <div class="glass-card mt-3 p-4">
+      <div class="flex flex-wrap gap-4 text-sm text-white/60">
+        <span>🌿 Default branch: <code class="text-white/80">${escapeHtml(defaultBranch)}</code></span>
+        <span>⭐ ${repoData?.stargazers_count || 0}</span>
+        <span>🍴 ${repoData?.forks_count || 0}</span>
+        <span>👁️ ${repoData?.watchers_count || 0}</span>
+        ${repoData?.language ? `<span>💻 ${repoData.language}</span>` : ''}
+        ${repoData?.license ? `<span>📄 ${repoData.license?.spdx_id || repoData.license?.name}</span>` : ''}
+      </div>
+      ${repoData?.description ? `<p class="mt-2 text-white/70 text-sm">${escapeHtml(repoData.description)}</p>` : ''}
+    </div>
   `
   return glassLayout(`Code - ${repo}`, user, content)
 }
