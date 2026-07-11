@@ -927,7 +927,7 @@ app.get('/repo/:owner/:repo/downloads/proxy', async (c) => {
   // Only allow GitHub / codeload domains
   let parsedUrl: URL
   try { parsedUrl = new URL(rawUrl) } catch { return c.json({ error: 'Invalid URL' }, 400) }
-  const allowedHosts = ['github.com', 'codeload.github.com', 'objects.githubusercontent.com', 'releases.githubusercontent.com']
+  const allowedHosts = ['github.com', 'codeload.github.com', 'objects.githubusercontent.com', 'releases.githubusercontent.com', 'raw.githubusercontent.com', 'githubusercontent.com', 'pipelines.actions.githubusercontent.com']
   if (!allowedHosts.some(h => parsedUrl.hostname === h || parsedUrl.hostname.endsWith('.' + h))) {
     return c.json({ error: 'URL not allowed' }, 403)
   }
