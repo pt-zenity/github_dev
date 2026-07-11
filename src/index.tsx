@@ -957,6 +957,65 @@ app.get('/repo/:owner/:repo/downloads/proxy', async (c) => {
   return new Response(resp.body, { headers })
 })
 
+// ==================== ACTIVITY FEED ====================
+app.get('/activity', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.redirect('/login')
+  const userCookie = getCookie(c, 'gh_user')
+  const user = userCookie ? JSON.parse(userCookie) : {}
+  return c.html(activityPage(user))
+})
+
+// SSE endpoint: streams GitHub events every 15s
+app.get('/api/activity/stream', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+
+  // Fetch events from GitHub API
+  const { data: events } = await githubApi(token, '/events?per_page=30')
+  const { data: receivedEvents } = await githubApi(token, '/users/' + (JSON.parse(getCookie(c, 'gh_user') || '{}').login || '') + '/received_events?per_page=30')
+
+  const allEvents = [
+    ...(Array.isArray(events) ? events : []),
+    ...(Array.isArray(receivedEvents) ? receivedEvents : [])
+  ]
+
+  // Sort by created_at descending, deduplicate by id
+  const seen = new Set<string>()
+  const sorted = allEvents
+    .filter(e => { if (seen.has(e.id)) return false; seen.add(e.id); return true })
+    .sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+    .slice(0, 50)
+
+  return c.json(sorted)
+})
+
+// REST endpoint for activity data (used by JS polling)
+app.get('/api/activity/feed', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const userCookie = getCookie(c, 'gh_user')
+  const userLogin = userCookie ? JSON.parse(userCookie).login : ''
+
+  const [ownEventsRes, receivedEventsRes] = await Promise.all([
+    githubApi(token, `/users/${userLogin}/events?per_page=30`),
+    githubApi(token, `/users/${userLogin}/received_events?per_page=30`),
+  ])
+
+  const allEvents: any[] = [
+    ...(Array.isArray(ownEventsRes.data) ? ownEventsRes.data : []),
+    ...(Array.isArray(receivedEventsRes.data) ? receivedEventsRes.data : []),
+  ]
+
+  const seen = new Set<string>()
+  const sorted = allEvents
+    .filter(e => { if (!e?.id || seen.has(e.id)) return false; seen.add(e.id); return true })
+    .sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+    .slice(0, 60)
+
+  return c.json(sorted)
+})
+
 // ==================== PAGE TEMPLATES ====================
 function glassLayout(title: string, user: any, content: string, activeRepo?: string) {
   const userStr = user?.login ? `
@@ -992,6 +1051,17 @@ function glassLayout(title: string, user: any, content: string, activeRepo?: str
         <svg width="28" height="28" viewBox="0 0 24 24" fill="white"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
         <span>GitManager</span>
       </a>
+      <nav class="header-nav">
+        <a href="/dashboard" class="header-nav-link">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          Dashboard
+        </a>
+        <a href="/activity" class="header-nav-link">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          Activity
+          <span class="live-dot" id="liveDot"></span>
+        </a>
+      </nav>
       ${userStr}
     </div>
   </header>
@@ -4365,6 +4435,355 @@ function userManagementPage(user: any, owner: string, repo: string, repoData: an
     </script>
   `
   return glassLayout(`User Management — ${repo}`, user, content)
+}
+
+// ==================== ACTIVITY PAGE ====================
+function activityPage(user: any): string {
+  const content = `
+  <div class="activity-header">
+    <div class="activity-title-row">
+      <h2 class="section-title" style="margin:0">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-right:8px"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        Activity Feed
+      </h2>
+      <div class="activity-controls">
+        <div class="live-indicator" id="liveIndicator">
+          <span class="live-pulse"></span>
+          <span id="liveStatus">Live</span>
+        </div>
+        <select id="filterType" class="activity-select" onchange="applyFilter()">
+          <option value="all">All Events</option>
+          <option value="PushEvent">Push</option>
+          <option value="PullRequestEvent">Pull Requests</option>
+          <option value="IssuesEvent">Issues</option>
+          <option value="CreateEvent">Create</option>
+          <option value="DeleteEvent">Delete</option>
+          <option value="WatchEvent">Stars</option>
+          <option value="ForkEvent">Forks</option>
+          <option value="ReleaseEvent">Releases</option>
+          <option value="WorkflowRunEvent">Workflow Runs</option>
+          <option value="CommitCommentEvent">Comments</option>
+          <option value="IssueCommentEvent">Issue Comments</option>
+        </select>
+        <button class="glass-btn-sm" onclick="refreshNow()" id="refreshBtn">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          Refresh
+        </button>
+        <span class="activity-last-updated" id="lastUpdated">–</span>
+      </div>
+    </div>
+    <div class="activity-stats" id="activityStats">
+      <div class="act-stat-pill">Loading...</div>
+    </div>
+  </div>
+
+  <div class="activity-layout">
+    <!-- Main Feed -->
+    <div class="activity-feed-col">
+      <div id="activityFeed" class="activity-feed">
+        <div class="activity-loading">
+          <div class="act-spinner"></div>
+          <p>Loading activity...</p>
+        </div>
+      </div>
+      <div id="noActivity" class="activity-empty hidden">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:.3"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        <p>No activity found</p>
+      </div>
+    </div>
+
+    <!-- Sidebar: Top Repos Activity -->
+    <aside class="activity-sidebar">
+      <div class="glass-card sidebar-card">
+        <h4 class="sidebar-title">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          Most Active Repos
+        </h4>
+        <div id="topRepos">
+          <div class="act-spinner" style="margin:16px auto;display:block"></div>
+        </div>
+      </div>
+
+      <div class="glass-card sidebar-card" style="margin-top:16px">
+        <h4 class="sidebar-title">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+          Event Types
+        </h4>
+        <div id="eventTypeSummary">
+          <div class="act-spinner" style="margin:16px auto;display:block"></div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <script>
+  let allEvents = [];
+  let currentFilter = 'all';
+  let refreshTimer = null;
+  let isRefreshing = false;
+  const REFRESH_INTERVAL = 15000; // 15 seconds
+
+  const EVENT_META = {
+    PushEvent:          { icon: '⬆️', color: '#6366f1', label: 'Push' },
+    PullRequestEvent:   { icon: '🔀', color: '#8b5cf6', label: 'Pull Request' },
+    IssuesEvent:        { icon: '⚠️', color: '#f59e0b', label: 'Issue' },
+    CreateEvent:        { icon: '✨', color: '#10b981', label: 'Create' },
+    DeleteEvent:        { icon: '🗑️', color: '#ef4444', label: 'Delete' },
+    WatchEvent:         { icon: '⭐', color: '#eab308', label: 'Star' },
+    ForkEvent:          { icon: '🍴', color: '#06b6d4', label: 'Fork' },
+    ReleaseEvent:       { icon: '🚀', color: '#3b82f6', label: 'Release' },
+    WorkflowRunEvent:   { icon: '⚡', color: '#a855f7', label: 'Workflow' },
+    CommitCommentEvent: { icon: '💬', color: '#64748b', label: 'Comment' },
+    IssueCommentEvent:  { icon: '💬', color: '#64748b', label: 'Comment' },
+    PullRequestReviewEvent: { icon: '👀', color: '#ec4899', label: 'Review' },
+    MemberEvent:        { icon: '👤', color: '#14b8a6', label: 'Member' },
+    PublicEvent:        { icon: '🌐', color: '#22c55e', label: 'Public' },
+    GollumEvent:        { icon: '📖', color: '#f97316', label: 'Wiki' },
+  };
+
+  function getEventMeta(type) {
+    return EVENT_META[type] || { icon: '📌', color: '#6b7280', label: type.replace('Event','') };
+  }
+
+  function buildEventDesc(event) {
+    const p = event.payload || {};
+    const actor = event.actor?.login || 'someone';
+    const repoName = event.repo?.name || '';
+    switch (event.type) {
+      case 'PushEvent': {
+        const branch = (p.ref || '').replace('refs/heads/','');
+        const count = p.size || p.commits?.length || 0;
+        const msg = p.commits?.[0]?.message?.split('\\n')[0] || '';
+        return \`pushed \${count} commit\${count!==1?'s':''} to <strong>\${branch}</strong>\${msg ? \`: <em class="commit-msg">\${escHtml(msg.substring(0,72))}</em>\` : ''}\`;
+      }
+      case 'PullRequestEvent':
+        return \`\${p.action || 'updated'} PR #\${p.pull_request?.number}: <em>\${escHtml((p.pull_request?.title||'').substring(0,60))}</em>\`;
+      case 'IssuesEvent':
+        return \`\${p.action || 'updated'} issue #\${p.issue?.number}: <em>\${escHtml((p.issue?.title||'').substring(0,60))}</em>\`;
+      case 'CreateEvent':
+        return \`created \${p.ref_type || 'branch'}\${p.ref ? \` <strong>\${escHtml(p.ref)}</strong>\` : ''}\`;
+      case 'DeleteEvent':
+        return \`deleted \${p.ref_type || 'branch'} <strong>\${escHtml(p.ref||'')}</strong>\`;
+      case 'WatchEvent':
+        return \`starred the repository\`;
+      case 'ForkEvent':
+        return \`forked to <strong>\${escHtml(p.forkee?.full_name||'')}</strong>\`;
+      case 'ReleaseEvent':
+        return \`\${p.action||'published'} release <strong>\${escHtml(p.release?.tag_name||'')}</strong>\`;
+      case 'WorkflowRunEvent':
+        const wStatus = p.workflow_run?.status;
+        const wConclusion = p.workflow_run?.conclusion;
+        const wName = p.workflow_run?.name || '';
+        const wIcon = wConclusion === 'success' ? '✅' : wConclusion === 'failure' ? '❌' : wStatus === 'in_progress' ? '⏳' : '🔄';
+        return \`workflow \${wIcon} <em>\${escHtml(wName)}</em> — \${wConclusion || wStatus || 'started'}\`;
+      case 'IssueCommentEvent':
+        return \`commented on issue #\${p.issue?.number}: <em>\${escHtml((p.comment?.body||'').substring(0,60))}</em>\`;
+      case 'CommitCommentEvent':
+        return \`commented on commit: <em>\${escHtml((p.comment?.body||'').substring(0,60))}</em>\`;
+      case 'PullRequestReviewEvent':
+        return \`reviewed PR #\${p.pull_request?.number}: <em>\${escHtml((p.pull_request?.title||'').substring(0,50))}</em>\`;
+      case 'MemberEvent':
+        return \`\${p.action||'added'} <strong>\${escHtml(p.member?.login||'')}</strong> as collaborator\`;
+      default:
+        return event.type.replace('Event','');
+    }
+  }
+
+  function escHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function timeAgoJs(dateStr) {
+    const diff = Math.floor((Date.now() - new Date(dateStr).getTime()) / 1000);
+    if (diff < 60)   return diff + 's ago';
+    if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+    if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
+    if (diff < 604800) return Math.floor(diff/86400) + 'd ago';
+    return new Date(dateStr).toLocaleDateString();
+  }
+
+  function buildRepoUrl(repoName) {
+    const parts = (repoName||'').split('/');
+    if (parts.length === 2) return \`/repo/\${parts[0]}/\${parts[1]}\`;
+    return '#';
+  }
+
+  function renderFeed(events) {
+    const feed = document.getElementById('activityFeed');
+    const noAct = document.getElementById('noActivity');
+    if (!events.length) {
+      feed.innerHTML = '';
+      noAct.classList.remove('hidden');
+      return;
+    }
+    noAct.classList.add('hidden');
+
+    // Group events by date
+    const groups = {};
+    events.forEach(e => {
+      const d = new Date(e.created_at);
+      const key = d.toLocaleDateString('en-US', { weekday:'long', year:'numeric', month:'long', day:'numeric' });
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(e);
+    });
+
+    let html = '';
+    for (const [date, evts] of Object.entries(groups)) {
+      html += \`<div class="act-date-group"><div class="act-date-label">\${date}</div>\`;
+      evts.forEach(event => {
+        const meta = getEventMeta(event.type);
+        const desc = buildEventDesc(event);
+        const repoUrl = buildRepoUrl(event.repo?.name);
+        const actor = event.actor;
+        html += \`
+        <div class="act-item" data-type="\${event.type}">
+          <div class="act-avatar-col">
+            <img src="\${actor?.avatar_url||''}" class="act-avatar" title="\${actor?.login||''}" 
+                 onerror="this.src='data:image/svg+xml,<svg xmlns=\\"http://www.w3.org/2000/svg\\" viewBox=\\"0 0 24 24\\" fill=\\"%23666\\"><circle cx=\\"12\\" cy=\\"8\\" r=\\"4\\"/><path d=\\"M4 20c0-4 3.6-7 8-7s8 3 8 7\\"/></svg>'"/>
+            <div class="act-type-dot" style="background:\${meta.color}" title="\${meta.label}"></div>
+          </div>
+          <div class="act-body">
+            <div class="act-main-line">
+              <span class="act-icon">\${meta.icon}</span>
+              <a href="https://github.com/\${actor?.login||''}" target="_blank" class="act-actor">\${actor?.login||'?'}</a>
+              <span class="act-desc">\${desc}</span>
+            </div>
+            <div class="act-sub-line">
+              <a href="\${repoUrl}" class="act-repo">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                \${escHtml(event.repo?.name||'')}
+              </a>
+              <span class="act-time" title="\${event.created_at}">\${timeAgoJs(event.created_at)}</span>
+            </div>
+          </div>
+        </div>\`;
+      });
+      html += '</div>';
+    }
+    feed.innerHTML = html;
+  }
+
+  function renderSidebar(events) {
+    // Top repos by activity count
+    const repoCounts = {};
+    events.forEach(e => {
+      const r = e.repo?.name || '';
+      if (r) repoCounts[r] = (repoCounts[r] || 0) + 1;
+    });
+    const topRepos = Object.entries(repoCounts).sort((a,b)=>b[1]-a[1]).slice(0,8);
+    const maxCount = topRepos[0]?.[1] || 1;
+    const reposHtml = topRepos.map(([name, count]) => {
+      const pct = Math.round((count / maxCount) * 100);
+      const url = buildRepoUrl(name);
+      const shortName = name.split('/')[1] || name;
+      return \`<div class="top-repo-item">
+        <div class="top-repo-header">
+          <a href="\${url}" class="top-repo-name" title="\${name}">\${escHtml(shortName)}</a>
+          <span class="top-repo-count">\${count}</span>
+        </div>
+        <div class="top-repo-bar"><div class="top-repo-bar-fill" style="width:\${pct}%"></div></div>
+      </div>\`;
+    }).join('');
+    document.getElementById('topRepos').innerHTML = topRepos.length ? reposHtml : '<p style="color:rgba(255,255,255,.4);font-size:12px;padding:8px 0">No data</p>';
+
+    // Event type summary
+    const typeCounts = {};
+    events.forEach(e => {
+      const meta = getEventMeta(e.type);
+      const label = meta.label;
+      if (!typeCounts[label]) typeCounts[label] = { count: 0, icon: meta.icon, color: meta.color };
+      typeCounts[label].count++;
+    });
+    const sortedTypes = Object.entries(typeCounts).sort((a,b)=>b[1].count-a[1].count);
+    const totalTypes = events.length;
+    const typesHtml = sortedTypes.map(([label, data]) => {
+      const pct = Math.round((data.count / totalTypes) * 100);
+      return \`<div class="evt-type-row">
+        <span class="evt-type-icon">\${data.icon}</span>
+        <span class="evt-type-label">\${label}</span>
+        <div class="evt-type-bar"><div class="evt-type-bar-fill" style="width:\${pct}%;background:\${data.color}"></div></div>
+        <span class="evt-type-count">\${data.count}</span>
+      </div>\`;
+    }).join('');
+    document.getElementById('eventTypeSummary').innerHTML = sortedTypes.length ? typesHtml : '<p style="color:rgba(255,255,255,.4);font-size:12px;padding:8px 0">No data</p>';
+  }
+
+  function renderStats(events) {
+    const typeCounts = {};
+    events.forEach(e => { typeCounts[e.type] = (typeCounts[e.type] || 0) + 1; });
+    const top3 = Object.entries(typeCounts).sort((a,b)=>b[1]-a[1]).slice(0,4);
+    const statsHtml = [
+      \`<div class="act-stat-pill"><strong>\${events.length}</strong> events</div>\`,
+      ...top3.map(([type, count]) => {
+        const m = getEventMeta(type);
+        return \`<div class="act-stat-pill" style="border-color:\${m.color}40;background:\${m.color}15">\${m.icon} \${count} \${m.label}</div>\`;
+      })
+    ].join('');
+    document.getElementById('activityStats').innerHTML = statsHtml;
+  }
+
+  function applyFilter() {
+    currentFilter = document.getElementById('filterType').value;
+    const filtered = currentFilter === 'all' ? allEvents : allEvents.filter(e => e.type === currentFilter);
+    renderFeed(filtered);
+  }
+
+  function setLiveStatus(status) {
+    const dot = document.getElementById('liveDot');
+    const ind = document.getElementById('liveIndicator');
+    const txt = document.getElementById('liveStatus');
+    if (status === 'live') {
+      txt.textContent = 'Live';
+      ind.className = 'live-indicator live-indicator--on';
+    } else if (status === 'loading') {
+      txt.textContent = 'Updating...';
+      ind.className = 'live-indicator live-indicator--loading';
+    } else {
+      txt.textContent = 'Paused';
+      ind.className = 'live-indicator live-indicator--off';
+    }
+  }
+
+  async function fetchActivity() {
+    if (isRefreshing) return;
+    isRefreshing = true;
+    setLiveStatus('loading');
+    document.getElementById('refreshBtn').disabled = true;
+    try {
+      const res = await fetch('/api/activity/feed');
+      if (!res.ok) throw new Error('fetch failed');
+      const events = await res.json();
+      allEvents = events;
+      applyFilter();
+      renderSidebar(events);
+      renderStats(events);
+      document.getElementById('lastUpdated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+      setLiveStatus('live');
+    } catch(e) {
+      setLiveStatus('off');
+      console.error('Activity fetch error', e);
+    } finally {
+      isRefreshing = false;
+      document.getElementById('refreshBtn').disabled = false;
+      scheduleNext();
+    }
+  }
+
+  function scheduleNext() {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(fetchActivity, REFRESH_INTERVAL);
+  }
+
+  function refreshNow() {
+    clearTimeout(refreshTimer);
+    fetchActivity();
+  }
+
+  // Start
+  fetchActivity();
+  </script>
+  `
+  return glassLayout('Activity Feed', user, content)
 }
 
 function formatBytes(bytes: number): string {
