@@ -859,6 +859,57 @@ app.get('/repo/:owner/:repo/users/:username/permission', async (c) => {
   return c.json(data, status as any)
 })
 
+// ==================== DOWNLOAD CENTER ====================
+app.get('/repo/:owner/:repo/downloads', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.redirect('/login')
+  const { owner, repo } = c.req.param()
+  const userCookie = getCookie(c, 'gh_user')
+  const user = userCookie ? JSON.parse(userCookie) : {}
+
+  const [repoRes, releasesRes, branchesRes, tagsRes, runsRes] = await Promise.all([
+    githubApi(token, `/repos/${owner}/${repo}`),
+    githubApi(token, `/repos/${owner}/${repo}/releases?per_page=10`),
+    githubApi(token, `/repos/${owner}/${repo}/branches?per_page=30`),
+    githubApi(token, `/repos/${owner}/${repo}/tags?per_page=30`),
+    githubApi(token, `/repos/${owner}/${repo}/actions/runs?per_page=10&status=completed`),
+  ])
+
+  return c.html(downloadPage(user, owner, repo, repoRes.data, releasesRes.data, branchesRes.data, tagsRes.data, runsRes.data))
+})
+
+// API: list artifacts for a workflow run
+app.get('/repo/:owner/:repo/downloads/runs/:runId/artifacts', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, runId } = c.req.param()
+  const { status, data } = await githubApi(token, `/repos/${owner}/${repo}/actions/runs/${runId}/artifacts?per_page=30`)
+  return c.json(data, status as any)
+})
+
+// API: get artifact download redirect URL (GitHub returns 302 to Azure blob)
+app.get('/repo/:owner/:repo/downloads/artifact/:artifactId', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, artifactId } = c.req.param()
+  // GitHub API: GET /repos/{owner}/{repo}/actions/artifacts/{id}/zip
+  // Returns 302 → Azure blob URL (short-lived). We proxy the Location header back.
+  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/artifacts/${artifactId}/zip`, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': 'GitManager/1.0',
+    },
+    redirect: 'manual',
+  })
+  if (resp.status === 302) {
+    const location = resp.headers.get('location')
+    if (location) return c.redirect(location, 302)
+  }
+  const { status, data } = await githubApi(token, `/repos/${owner}/${repo}/actions/artifacts/${artifactId}/zip`)
+  return c.json({ error: 'Could not get download URL', status }, 502)
+})
+
 // ==================== PAGE TEMPLATES ====================
 function glassLayout(title: string, user: any, content: string, activeRepo?: string) {
   const userStr = user?.login ? `
@@ -924,6 +975,7 @@ function repoNav(owner: string, repo: string, active: string, repoData?: any) {
     { key: 'pulls', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><line x1="6" y1="9" x2="6" y2="21"/></svg> Pull Requests', href: `/repo/${owner}/${repo}/pulls` },
     { key: 'actions', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Actions', href: `/repo/${owner}/${repo}/actions` },
     { key: 'releases', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Releases', href: `/repo/${owner}/${repo}/releases` },
+    { key: 'downloads', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/><circle cx="12" cy="8" r="3" fill="currentColor" stroke="none"/></svg> Downloads', href: `/repo/${owner}/${repo}/downloads` },
     { key: 'environments', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg> Environments', href: `/repo/${owner}/${repo}/environments` },
     { key: 'secrets', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg> Secrets', href: `/repo/${owner}/${repo}/settings/secrets` },
     { key: 'variables', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></svg> Variables', href: `/repo/${owner}/${repo}/settings/variables` },
@@ -3449,6 +3501,308 @@ async function sealedBoxAsync(message: Uint8Array, recipientPublicKey: Uint8Arra
   result.set(ephemeralKeypair.publicKey, 0)
   result.set(ciphertext, 32)
   return result
+}
+
+// ==================== DOWNLOAD CENTER PAGE ====================
+function downloadPage(user: any, owner: string, repo: string, repoData: any, releases: any[], branches: any[], tags: any[], runsData: any) {
+  const repoErr = !repoData || repoData.message
+  const relItems  = Array.isArray(releases) ? releases : []
+  const brItems   = Array.isArray(branches) ? branches : []
+  const tagItems  = Array.isArray(tags) ? tags : []
+  const runs      = Array.isArray(runsData?.workflow_runs) ? runsData.workflow_runs : []
+  const defaultBranch = repoData?.default_branch || 'main'
+  const OWNER = escapeHtml(owner), REPO = escapeHtml(repo)
+
+  // ---- Release assets section ----
+  const releaseSection = relItems.length === 0
+    ? `<div class="dl-empty"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><p>Belum ada releases</p></div>`
+    : relItems.map((r: any) => {
+        const assets = Array.isArray(r.assets) ? r.assets : []
+        const srcZip = `https://github.com/${owner}/${repo}/archive/refs/tags/${r.tag_name}.zip`
+        const srcTar = `https://github.com/${owner}/${repo}/archive/refs/tags/${r.tag_name}.tar.gz`
+        return `
+        <div class="dl-release-card">
+          <div class="dl-release-header">
+            <div class="dl-release-meta">
+              <span class="dl-release-tag">${escapeHtml(r.tag_name)}</span>
+              ${r.prerelease ? '<span class="dl-badge dl-badge-pre">Pre-release</span>' : '<span class="dl-badge dl-badge-latest">Release</span>'}
+              ${r.draft ? '<span class="dl-badge dl-badge-draft">Draft</span>' : ''}
+              <span class="dl-release-date">${timeAgo(r.published_at || r.created_at)}</span>
+            </div>
+            <h4 class="dl-release-name">${escapeHtml(r.name || r.tag_name)}</h4>
+          </div>
+          <div class="dl-asset-list">
+            <div class="dl-asset-row dl-asset-src">
+              <div class="dl-asset-icon">🗜️</div>
+              <div class="dl-asset-info"><span class="dl-asset-name">Source code (zip)</span><span class="dl-asset-size">auto</span></div>
+              <a href="${srcZip}" class="dl-btn" download>⬇ ZIP</a>
+            </div>
+            <div class="dl-asset-row dl-asset-src">
+              <div class="dl-asset-icon">🗜️</div>
+              <div class="dl-asset-info"><span class="dl-asset-name">Source code (tar.gz)</span><span class="dl-asset-size">auto</span></div>
+              <a href="${srcTar}" class="dl-btn" download>⬇ TAR</a>
+            </div>
+            ${assets.map((a: any) => `
+            <div class="dl-asset-row">
+              <div class="dl-asset-icon">${getAssetIcon(a.name)}</div>
+              <div class="dl-asset-info">
+                <span class="dl-asset-name" title="${escapeHtml(a.name)}">${escapeHtml(a.name)}</span>
+                <span class="dl-asset-size">${formatBytes(a.size)} · ${(a.download_count||0).toLocaleString()} downloads</span>
+              </div>
+              <a href="${escapeHtml(a.browser_download_url)}" class="dl-btn" download>⬇ Download</a>
+            </div>`).join('')}
+          </div>
+        </div>`
+      }).join('')
+
+  // ---- Source archive section (branches + tags) ----
+  const allRefs = [
+    ...brItems.map((b: any) => ({ name: b.name, type: 'branch', sha: b.commit?.sha?.substring(0,7) })),
+    ...tagItems.map((t: any) => ({ name: t.name, type: 'tag', sha: t.commit?.sha?.substring(0,7) })),
+  ]
+
+  const sourceRows = allRefs.map((ref: any) => {
+    const encName = encodeURIComponent(ref.name)
+    const zipUrl  = `https://github.com/${owner}/${repo}/archive/refs/heads/${encName}.zip`
+    const tarUrl  = `https://github.com/${owner}/${repo}/archive/refs/heads/${encName}.tar.gz`
+    const zipTagUrl  = `https://github.com/${owner}/${repo}/archive/refs/tags/${encName}.zip`
+    const tarTagUrl  = `https://github.com/${owner}/${repo}/archive/refs/tags/${encName}.tar.gz`
+    const finalZip = ref.type === 'tag' ? zipTagUrl : zipUrl
+    const finalTar = ref.type === 'tag' ? tarTagUrl : tarUrl
+    return `
+    <div class="dl-ref-row" data-ref-type="${ref.type}">
+      <div class="dl-ref-icon">${ref.type === 'branch' ? '🌿' : '🏷️'}</div>
+      <div class="dl-ref-info">
+        <span class="dl-ref-name">${escapeHtml(ref.name)}</span>
+        <span class="dl-ref-sha">${ref.type} · ${ref.sha || ''}</span>
+      </div>
+      <div class="dl-ref-btns">
+        <a href="${finalZip}" class="dl-btn dl-btn-sm" download title="Download ZIP">⬇ ZIP</a>
+        <a href="${finalTar}" class="dl-btn dl-btn-sm dl-btn-ghost" download title="Download TAR.GZ">⬇ TAR</a>
+      </div>
+    </div>`
+  }).join('')
+
+  // ---- Workflow Artifacts section ----
+  const artifactRunRows = runs.length === 0
+    ? `<div class="dl-empty"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg><p>Tidak ada workflow runs</p></div>`
+    : runs.map((run: any) => `
+      <div class="dl-run-row" id="run-${run.id}">
+        <div class="dl-run-icon">${run.conclusion === 'success' ? '✅' : run.conclusion === 'failure' ? '❌' : '⚪'}</div>
+        <div class="dl-run-info">
+          <span class="dl-run-name">${escapeHtml(run.display_title || run.head_commit?.message?.split('\n')[0] || 'Run #'+run.run_number)}</span>
+          <span class="dl-run-meta">#${run.run_number} · ${escapeHtml(run.name||'')} · ${timeAgo(run.updated_at)}</span>
+        </div>
+        <button class="dl-btn dl-btn-sm" onclick="loadArtifacts(${run.id}, this)">📦 Artifacts</button>
+      </div>
+      <div class="dl-artifacts-panel" id="artifacts-${run.id}" style="display:none"></div>
+    `).join('')
+
+  const content = `
+    ${repoNav(owner, repo, 'downloads', repoData)}
+    <div class="dl-page">
+
+      <!-- Header stats bar -->
+      <div class="dl-stats-bar">
+        <div class="dl-stat">
+          <div class="dl-stat-val">${relItems.length}</div>
+          <div class="dl-stat-label">Releases</div>
+        </div>
+        <div class="dl-stat">
+          <div class="dl-stat-val">${relItems.reduce((s: number, r: any) => s + (r.assets?.length || 0), 0)}</div>
+          <div class="dl-stat-label">Assets</div>
+        </div>
+        <div class="dl-stat">
+          <div class="dl-stat-val">${brItems.length}</div>
+          <div class="dl-stat-label">Branches</div>
+        </div>
+        <div class="dl-stat">
+          <div class="dl-stat-val">${tagItems.length}</div>
+          <div class="dl-stat-label">Tags</div>
+        </div>
+      </div>
+
+      <!-- Tab nav -->
+      <div class="dl-tabs" id="dlTabs">
+        <button class="dl-tab active" onclick="dlSwitch('releases', this)">📦 Release Assets</button>
+        <button class="dl-tab" onclick="dlSwitch('source', this)">🗜️ Source Archives</button>
+        <button class="dl-tab" onclick="dlSwitch('artifacts', this)">⚡ Workflow Artifacts</button>
+        <button class="dl-tab" onclick="dlSwitch('file', this)">📄 File Finder</button>
+      </div>
+
+      <!-- Tab: Release Assets -->
+      <div class="dl-panel active" id="dl-releases">
+        ${releaseSection}
+      </div>
+
+      <!-- Tab: Source Archives -->
+      <div class="dl-panel" id="dl-source">
+        <div class="dl-filter-row">
+          <input id="refFilter" class="dl-filter-input" placeholder="🔍 Filter branch / tag..." oninput="filterRefs(this.value)" />
+          <label class="dl-filter-check"><input type="checkbox" id="showBranch" checked onchange="filterRefs()"> Branches</label>
+          <label class="dl-filter-check"><input type="checkbox" id="showTag" checked onchange="filterRefs()"> Tags</label>
+        </div>
+        <div id="refList">
+          ${sourceRows || '<div class="dl-empty"><p>Tidak ada branch / tag</p></div>'}
+        </div>
+      </div>
+
+      <!-- Tab: Workflow Artifacts -->
+      <div class="dl-panel" id="dl-artifacts">
+        <p class="dl-hint">Klik tombol <strong>Artifacts</strong> di bawah untuk melihat artifact dari setiap run. Artifact diunduh sebagai file ZIP.</p>
+        <div id="runList">
+          ${artifactRunRows}
+        </div>
+      </div>
+
+      <!-- Tab: File Finder -->
+      <div class="dl-panel" id="dl-file">
+        <div class="dl-file-search-wrap">
+          <div class="dl-file-search-row">
+            <div class="dl-file-branch-wrap">
+              <select id="fileBranch" class="dl-branch-select">
+                ${[defaultBranch, ...brItems.filter((b: any) => b.name !== defaultBranch).map((b: any) => b.name)].map((n: string) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')}
+              </select>
+            </div>
+            <input id="filePathInput" class="dl-file-path-input" placeholder="Path file, mis: src/index.tsx" />
+            <button class="dl-btn" onclick="fetchFile()">🔍 Cari</button>
+          </div>
+          <p class="dl-hint" style="margin-top:8px">Masukkan path file di repo, lalu klik Cari untuk mendapatkan link download langsung.</p>
+        </div>
+        <div id="fileResult" style="margin-top:16px"></div>
+      </div>
+
+    </div><!-- /.dl-page -->
+
+    <script>
+    const DL_OWNER = '${OWNER}', DL_REPO = '${REPO}';
+
+    // Tab switcher
+    function dlSwitch(tab, btn) {
+      document.querySelectorAll('.dl-tab').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.dl-panel').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById('dl-' + tab).classList.add('active');
+    }
+
+    // Source archive filter
+    function filterRefs(val) {
+      const q = (val ?? document.getElementById('refFilter').value).toLowerCase();
+      const showBr = document.getElementById('showBranch').checked;
+      const showTg = document.getElementById('showTag').checked;
+      document.querySelectorAll('.dl-ref-row').forEach(row => {
+        const type = row.dataset.refType;
+        const name = row.querySelector('.dl-ref-name').textContent.toLowerCase();
+        const typeOk = (type === 'branch' && showBr) || (type === 'tag' && showTg);
+        row.style.display = typeOk && name.includes(q) ? '' : 'none';
+      });
+    }
+
+    // Load artifacts for a run
+    async function loadArtifacts(runId, btn) {
+      const panel = document.getElementById('artifacts-' + runId);
+      if (panel.style.display !== 'none') { panel.style.display = 'none'; btn.textContent = '📦 Artifacts'; return; }
+      btn.textContent = '⏳ Loading...'; btn.disabled = true;
+      try {
+        const res = await fetch(\`/repo/\${DL_OWNER}/\${DL_REPO}/downloads/runs/\${runId}/artifacts\`);
+        const data = await res.json();
+        const arts = data.artifacts || [];
+        if (arts.length === 0) {
+          panel.innerHTML = '<div class="dl-artifact-empty">Tidak ada artifact di run ini</div>';
+        } else {
+          panel.innerHTML = arts.map(a => \`
+            <div class="dl-artifact-row">
+              <div class="dl-artifact-icon">📦</div>
+              <div class="dl-artifact-info">
+                <span class="dl-artifact-name">\${a.name}</span>
+                <span class="dl-artifact-meta">\${formatBytesJS(a.size_in_bytes)} · Expires \${a.expires_at ? new Date(a.expires_at).toLocaleDateString() : 'unknown'}</span>
+              </div>
+              <a href="/repo/\${DL_OWNER}/\${DL_REPO}/downloads/artifact/\${a.id}" class="dl-btn dl-btn-sm">⬇ Download</a>
+            </div>
+          \`).join('');
+        }
+        panel.style.display = 'block';
+      } catch(e) {
+        panel.innerHTML = '<div class="dl-artifact-empty" style="color:#f87171">Gagal memuat artifacts</div>';
+        panel.style.display = 'block';
+      }
+      btn.textContent = '📦 Hide'; btn.disabled = false;
+    }
+
+    // File finder
+    async function fetchFile() {
+      const branch = document.getElementById('fileBranch').value.trim();
+      const path   = document.getElementById('filePathInput').value.trim();
+      const result = document.getElementById('fileResult');
+      if (!path) { result.innerHTML = '<div class="dl-artifact-empty" style="color:#fbbf24">Masukkan path file terlebih dahulu</div>'; return; }
+      result.innerHTML = '<div class="dl-artifact-empty">⏳ Mencari file...</div>';
+      try {
+        const res  = await fetch(\`/api/github/repos/\${DL_OWNER}/\${DL_REPO}/contents/\${encodeURIComponent(path)}?ref=\${encodeURIComponent(branch)}\`);
+        const data = await res.json();
+        if (data.message) { result.innerHTML = \`<div class="dl-artifact-empty" style="color:#f87171">❌ \${data.message}</div>\`; return; }
+        if (data.type === 'file') {
+          const sizeStr = formatBytesJS(data.size);
+          result.innerHTML = \`
+            <div class="dl-file-result-card">
+              <div class="dl-file-result-icon">\${getFileIconJS(data.name)}</div>
+              <div class="dl-file-result-info">
+                <span class="dl-file-result-name">\${data.name}</span>
+                <span class="dl-file-result-meta">\${data.path} · \${sizeStr}</span>
+              </div>
+              <div class="dl-file-result-btns">
+                \${data.download_url ? \`<a href="\${data.download_url}" class="dl-btn" download>⬇ Download Raw</a>\` : ''}
+                <a href="\${data.html_url}" target="_blank" class="dl-btn dl-btn-ghost">📄 View on GitHub</a>
+              </div>
+            </div>
+          \`;
+        } else if (Array.isArray(data)) {
+          result.innerHTML = \`
+            <div class="dl-dir-result">
+              <div class="dl-dir-header">📁 Direktori · \${data.length} item</div>
+              <div class="dl-dir-list">
+                \${data.map(f => \`
+                  <div class="dl-dir-item" onclick="selectDirItem('\${f.path}')">
+                    <span>\${f.type === 'dir' ? '📁' : getFileIconJS(f.name)}</span>
+                    <span class="dl-dir-item-name">\${f.name}</span>
+                    <span class="dl-dir-item-size">\${f.type === 'file' ? formatBytesJS(f.size) : ''}</span>
+                    \${f.type === 'file' && f.download_url ? \`<a href="\${f.download_url}" class="dl-btn dl-btn-sm" download>⬇</a>\` : ''}
+                  </div>
+                \`).join('')}
+              </div>
+            </div>
+          \`;
+        }
+      } catch(e) {
+        result.innerHTML = '<div class="dl-artifact-empty" style="color:#f87171">Gagal mengambil file</div>';
+      }
+    }
+
+    function selectDirItem(path) {
+      document.getElementById('filePathInput').value = path;
+      fetchFile();
+    }
+
+    function formatBytesJS(bytes) {
+      if (!bytes) return '0 B';
+      const k = 1024, sizes = ['B','KB','MB','GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+
+    function getFileIconJS(name) {
+      const ext = (name || '').split('.').pop().toLowerCase();
+      const map = { zip:'🗜️', gz:'🗜️', tar:'🗜️', '7z':'🗜️', rar:'🗜️', exe:'⚙️', dmg:'🍎', pkg:'📦', deb:'🐧', rpm:'🐧', apk:'🤖', ipa:'📱', js:'🟨', ts:'🔷', py:'🐍', java:'☕', go:'🐹', rs:'🦀', md:'📝', txt:'📄', pdf:'📕', png:'🖼️', jpg:'🖼️', gif:'🖼️', svg:'🎨', mp4:'🎬', mp3:'🎵' };
+      return map[ext] || '📄';
+    }
+    </script>
+  `
+  return glassLayout(`Downloads - ${repo}`, user, content)
+}
+
+function getAssetIcon(name: string): string {
+  const ext = (name || '').split('.').pop()?.toLowerCase() || ''
+  const map: Record<string, string> = { zip:'🗜️', gz:'🗜️', tar:'🗜️', '7z':'🗜️', rar:'🗜️', exe:'⚙️', dmg:'🍎', pkg:'📦', deb:'🐧', rpm:'🐧', apk:'🤖', ipa:'📱', js:'🟨', ts:'🔷', py:'🐍', md:'📝', txt:'📄', pdf:'📕', png:'🖼️', jpg:'🖼️', svg:'🎨' }
+  return map[ext] || '📄'
 }
 
 function escapeHtml(str: string): string {
