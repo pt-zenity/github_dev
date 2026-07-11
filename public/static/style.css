@@ -709,3 +709,28 @@ pre { background: rgba(0,0,0,0.3); border-radius: 0 0 12px 12px; }
 /* Danger button */
 .btn-danger       { color: #fca5a5 !important; border-color: rgba(239,68,68,0.25) !important; }
 .btn-danger:hover { background: rgba(239,68,68,0.12) !important; color: #f87171 !important; }
+
+/* ==================== WORKFLOW DISPATCH MODAL ==================== */
+.dispatch-checking    { display:flex; align-items:center; gap:8px; color:rgba(255,255,255,0.45); font-size:13px; padding:8px 0; }
+
+/* No-dispatch warning box */
+.dispatch-no-trigger        { display:flex; gap:14px; background:rgba(234,179,8,0.07); border:1px solid rgba(234,179,8,0.25); border-radius:10px; padding:16px; }
+.dispatch-no-trigger-icon   { font-size:22px; flex-shrink:0; line-height:1; }
+.dispatch-no-trigger-title  { font-size:14px; font-weight:600; color:#fde047; margin-bottom:6px; }
+.dispatch-no-trigger-body   { font-size:12.5px; color:rgba(255,255,255,0.55); line-height:1.6; }
+.dispatch-no-trigger-body code { background:rgba(255,255,255,0.1); border-radius:4px; padding:1px 5px; font-family:monospace; color:#fde047; }
+
+/* YAML hint block inside warning */
+.dispatch-yaml-hint   { background:#0d1117; border:1px solid rgba(255,255,255,0.08); border-radius:6px; padding:8px 12px; font-size:12px; color:#86efac; margin-top:8px; white-space:pre; font-family:'Fira Code',monospace; }
+
+/* Trigger badges row */
+.dispatch-triggers-row  { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:14px; }
+.dispatch-trigger-badges { }
+.trigger-badge          { display:inline-flex; align-items:center; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:500; }
+.trigger-dispatch       { background:rgba(34,197,94,0.12); border:1px solid rgba(34,197,94,0.3); color:#86efac; }
+.trigger-other          { background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); color:rgba(255,255,255,0.5); }
+
+/* Run button states on the workflow list */
+.wf-run-btn             { transition: all .15s; }
+.wf-run-btn.confirmed   { color:#86efac !important; border-color:rgba(34,197,94,.35) !important; }
+.wf-no-dispatch         { color:rgba(255,255,255,0.25) !important; border-color:rgba(255,255,255,0.1) !important; cursor:not-allowed !important; }

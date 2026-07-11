@@ -473,7 +473,56 @@ app.post('/repo/:owner/:repo/actions/workflows/:workflowId/dispatch', async (c) 
     body: JSON.stringify({ ref, inputs })
   })
   if (res.status === 204) return c.json({ success: true })
+
+  // Translate GitHub's 422 into a clearer message
+  const ghMsg: string = res.data?.message || ''
+  if (res.status === 422 && ghMsg.toLowerCase().includes('workflow_dispatch')) {
+    return c.json({
+      error: 'Workflow ini tidak mendukung manual trigger.',
+      hint: 'Tambahkan "workflow_dispatch:" ke bagian "on:" di file YAML workflow ini.',
+      detail: res.data
+    }, 422)
+  }
   return c.json({ error: 'Dispatch failed', detail: res.data, status: res.status }, 400)
+})
+
+// API: Check if a workflow supports workflow_dispatch (parse its YAML triggers)
+app.get('/repo/:owner/:repo/actions/workflows/:workflowId/triggers', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, workflowId } = c.req.param()
+
+  // Get the workflow metadata to find its file path
+  const wfRes = await githubApi(token, `/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(workflowId)}`)
+  if (!wfRes.data?.path) return c.json({ dispatchable: false, triggers: [] })
+
+  // Fetch the raw YAML file
+  const filePath = wfRes.data.path  // e.g. ".github/workflows/ci.yml"
+  const ref = c.req.query('ref') || 'HEAD'
+  const contentRes = await githubApi(token, `/repos/${owner}/${repo}/contents/${encodeURIComponent(filePath)}?ref=${ref}`)
+
+  if (!contentRes.data?.content) return c.json({ dispatchable: false, triggers: [] })
+
+  // Decode base64 content and extract triggers from the "on:" block
+  const yamlText = atob(contentRes.data.content.replace(/\n/g, ''))
+
+  // Quick regex-based trigger detection (no full YAML parser needed)
+  // Matches: "on: [push, workflow_dispatch]"  or  "on:\n  workflow_dispatch:"
+  const triggers: string[] = []
+  // Array form: on: [push, pull_request, workflow_dispatch]
+  const arrayMatch = yamlText.match(/^on:\s*\[([^\]]+)\]/m)
+  if (arrayMatch) {
+    arrayMatch[1].split(',').map(t => t.trim()).forEach(t => triggers.push(t))
+  }
+  // Block form: "on:\n  workflow_dispatch:\n  push:"
+  const blockMatches = yamlText.matchAll(/^  ([a-z_]+)\s*:/gm)
+  for (const m of blockMatches) triggers.push(m[1])
+  // Inline single-value form: "on: push"
+  const singleMatch = yamlText.match(/^on:\s+([a-z_]+)\s*$/m)
+  if (singleMatch) triggers.push(singleMatch[1])
+
+  const dispatchable = triggers.includes('workflow_dispatch')
+  return c.json({ dispatchable, triggers: [...new Set(triggers)], path: filePath })
 })
 
 // API: Cancel a run
@@ -1659,12 +1708,15 @@ function actionsPage(user: any, owner: string, repo: string, runs: any, workflow
                     <div class="wf-path">${escapeHtml(w.path)}</div>
                   </div>
                 </div>
-                <div class="wf-item-actions">
+              <div class="wf-item-actions">
                   <a href="/repo/${owner}/${repo}/actions?workflow=${w.id}" class="glass-btn-sm ${wfFilter === String(w.id) ? 'active' : ''}">
                     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
                     Filter
                   </a>
-                  <button class="glass-btn-sm text-green-300" onclick="openDispatch('${w.id}','${escapeHtml(w.name)}')">
+                  <button class="glass-btn-sm wf-run-btn text-green-300"
+                    id="runbtn-${w.id}"
+                    onclick="openDispatch('${w.id}','${escapeHtml(w.name)}',this)"
+                    title="Periksa apakah workflow mendukung manual trigger...">
                     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                     Run
                   </button>
@@ -1723,7 +1775,7 @@ function actionsPage(user: any, owner: string, repo: string, runs: any, workflow
 
     <!-- Dispatch Modal -->
     <div id="dispatchBackdrop" class="modal-backdrop hidden" onclick="closeDispatch()"></div>
-    <div id="dispatchModal" class="secret-modal hidden" style="max-width:480px">
+    <div id="dispatchModal" class="secret-modal hidden" style="max-width:500px">
       <div class="modal-header">
         <h3 class="modal-title">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:inline;vertical-align:-2px"><polygon points="5 3 19 12 5 21 5 3"/></svg>
@@ -1732,21 +1784,45 @@ function actionsPage(user: any, owner: string, repo: string, runs: any, workflow
         <button class="modal-close" onclick="closeDispatch()">✕</button>
       </div>
       <div class="modal-body">
-        <div class="form-group">
-          <label class="form-label">Branch / Tag</label>
-          <input type="text" id="dispatchRef" class="form-input font-mono" value="${repoData?.default_branch || 'main'}" placeholder="main" />
-          <div class="text-white/30 text-xs mt-1">Branch atau tag yang akan dijalankan workflow-nya</div>
+        <!-- Trigger check loading state -->
+        <div id="dispatchChecking" class="dispatch-checking">
+          <span class="spin">⟳</span> Memeriksa triggers workflow…
         </div>
-        <div class="form-group" id="dispatchInputsGroup" style="display:none">
-          <label class="form-label">Inputs (JSON)</label>
-          <textarea id="dispatchInputs" class="form-input font-mono" rows="3" placeholder='{"key": "value"}'></textarea>
-          <div class="text-white/30 text-xs mt-1">Opsional: workflow_dispatch inputs dalam format JSON</div>
+        <!-- No dispatch trigger warning -->
+        <div id="dispatchNoTrigger" class="hidden">
+          <div class="dispatch-no-trigger">
+            <div class="dispatch-no-trigger-icon">⚠</div>
+            <div>
+              <div class="dispatch-no-trigger-title">Workflow tidak mendukung manual trigger</div>
+              <div class="dispatch-no-trigger-body">
+                Workflow ini tidak memiliki trigger <code>workflow_dispatch</code>.<br>
+                Untuk mengaktifkan manual trigger, tambahkan ke file YAML:
+                <pre class="dispatch-yaml-hint">on:
+  workflow_dispatch:</pre>
+              </div>
+              <div id="dispatchTriggerList" class="dispatch-trigger-list"></div>
+            </div>
+          </div>
         </div>
-        <div id="dispatchError" class="alert-error hidden"></div>
+        <!-- Dispatchable form -->
+        <div id="dispatchForm" class="hidden">
+          <div id="dispatchTriggerBadges" class="dispatch-trigger-badges"></div>
+          <div class="form-group">
+            <label class="form-label">Branch / Tag</label>
+            <input type="text" id="dispatchRef" class="form-input font-mono" value="${repoData?.default_branch || 'main'}" placeholder="main" />
+            <div class="text-white/30 text-xs mt-1">Branch atau tag yang akan dijalankan workflow-nya</div>
+          </div>
+          <div class="form-group" id="dispatchInputsGroup" style="display:none">
+            <label class="form-label">Inputs (JSON)</label>
+            <textarea id="dispatchInputs" class="form-input font-mono" rows="3" placeholder='{"key": "value"}'></textarea>
+            <div class="text-white/30 text-xs mt-1">Opsional: workflow_dispatch inputs dalam format JSON</div>
+          </div>
+          <div id="dispatchError" class="alert-error hidden"></div>
+        </div>
       </div>
       <div class="modal-footer">
-        <button class="glass-btn-sm" onclick="closeDispatch()">Batal</button>
-        <button class="btn-primary" id="dispatchBtn" onclick="triggerDispatch()">
+        <button class="glass-btn-sm" onclick="closeDispatch()">Tutup</button>
+        <button class="btn-primary hidden" id="dispatchBtn" onclick="triggerDispatch()">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
           Jalankan
         </button>
@@ -1773,44 +1849,91 @@ function actionsPage(user: any, owner: string, repo: string, runs: any, workflow
     }
 
     // ── Dispatch ──
-    function openDispatch(id, name) {
-      currentDispatchId=id;
-      document.getElementById('dispatchName').textContent=name;
+    function openDispatch(id, name, btn) {
+      currentDispatchId = id;
+      document.getElementById('dispatchName').textContent = name;
+      // Reset modal state
+      document.getElementById('dispatchChecking').classList.remove('hidden');
+      document.getElementById('dispatchNoTrigger').classList.add('hidden');
+      document.getElementById('dispatchForm').classList.add('hidden');
+      document.getElementById('dispatchBtn').classList.add('hidden');
       document.getElementById('dispatchError').classList.add('hidden');
       document.getElementById('dispatchBackdrop').classList.remove('hidden');
       document.getElementById('dispatchModal').classList.remove('hidden');
-      setTimeout(()=>document.getElementById('dispatchRef').focus(),50);
+
+      // Fetch triggers from backend
+      fetch(\`/repo/\${OWNER}/\${REPO}/actions/workflows/\${encodeURIComponent(id)}/triggers\`)
+        .then(r => r.json())
+        .then(data => {
+          document.getElementById('dispatchChecking').classList.add('hidden');
+          if (data.dispatchable) {
+            // Show trigger badges
+            const badges = (data.triggers || []).map(t =>
+              \`<span class="trigger-badge \${t === 'workflow_dispatch' ? 'trigger-dispatch' : 'trigger-other'}">\${t}</span>\`
+            ).join('');
+            document.getElementById('dispatchTriggerBadges').innerHTML =
+              \`<div class="dispatch-triggers-row"><span class="text-white/40 text-xs">Triggers:</span> \${badges}</div>\`;
+            document.getElementById('dispatchForm').classList.remove('hidden');
+            document.getElementById('dispatchBtn').classList.remove('hidden');
+            setTimeout(() => document.getElementById('dispatchRef').focus(), 50);
+            // Update Run button to show it's confirmed dispatchable
+            if (btn) { btn.classList.add('confirmed'); btn.title = 'Workflow mendukung workflow_dispatch'; }
+          } else {
+            // Not dispatchable — show friendly explanation
+            const triggers = data.triggers || [];
+            const listHtml = triggers.length
+              ? \`<div class="mt-2 text-white/40 text-xs">Trigger saat ini: \${triggers.map(t => \`<code>\${t}</code>\`).join(', ')}</div>\`
+              : '<div class="mt-2 text-white/40 text-xs">Tidak ada trigger yang terdeteksi.</div>';
+            document.getElementById('dispatchTriggerList').innerHTML = listHtml;
+            document.getElementById('dispatchNoTrigger').classList.remove('hidden');
+            // Grey out the Run button permanently
+            if (btn) { btn.disabled = true; btn.classList.remove('text-green-300'); btn.classList.add('wf-no-dispatch'); btn.title = 'Tidak ada trigger workflow_dispatch'; }
+          }
+        })
+        .catch(err => {
+          document.getElementById('dispatchChecking').classList.add('hidden');
+          // On network error, still allow attempting dispatch
+          document.getElementById('dispatchForm').classList.remove('hidden');
+          document.getElementById('dispatchBtn').classList.remove('hidden');
+          document.getElementById('dispatchError').textContent = 'Gagal cek triggers: ' + err.message + '. Coba tetap jalankan.';
+          document.getElementById('dispatchError').classList.remove('hidden');
+          setTimeout(() => document.getElementById('dispatchRef').focus(), 50);
+        });
     }
     function closeDispatch() {
       document.getElementById('dispatchBackdrop').classList.add('hidden');
       document.getElementById('dispatchModal').classList.add('hidden');
     }
     async function triggerDispatch() {
-      const ref=document.getElementById('dispatchRef').value.trim();
-      const inputsRaw=document.getElementById('dispatchInputs').value.trim();
-      const errEl=document.getElementById('dispatchError');
+      const ref = document.getElementById('dispatchRef').value.trim();
+      const inputsRaw = document.getElementById('dispatchInputs').value.trim();
+      const errEl = document.getElementById('dispatchError');
       errEl.classList.add('hidden');
-      if(!ref){errEl.textContent='Branch/tag tidak boleh kosong';errEl.classList.remove('hidden');return;}
-      let inputs={};
-      if(inputsRaw){try{inputs=JSON.parse(inputsRaw);}catch(e){errEl.textContent='Inputs bukan JSON valid';errEl.classList.remove('hidden');return;}}
-      const btn=document.getElementById('dispatchBtn');
-      btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Menjalankan...';
+      if (!ref) { errEl.textContent = 'Branch/tag tidak boleh kosong'; errEl.classList.remove('hidden'); return; }
+      let inputs = {};
+      if (inputsRaw) { try { inputs = JSON.parse(inputsRaw); } catch(e) { errEl.textContent = 'Inputs bukan JSON valid'; errEl.classList.remove('hidden'); return; } }
+      const btn = document.getElementById('dispatchBtn');
+      btn.disabled = true; btn.innerHTML = '<span class="spin">⟳</span> Menjalankan...';
       try {
-        const res=await fetch(\`/repo/\${OWNER}/\${REPO}/actions/workflows/\${encodeURIComponent(currentDispatchId)}/dispatch\`,{
-          method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({ref,inputs})
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/actions/workflows/\${encodeURIComponent(currentDispatchId)}/dispatch\`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ref, inputs })
         });
-        const data=await res.json();
-        if(data.success){
+        const data = await res.json();
+        if (data.success) {
           closeDispatch();
-          showToast('Workflow berhasil di-trigger! Tunggu beberapa detik lalu refresh.');
-          setTimeout(()=>location.reload(),3000);
+          showToast('✓ Workflow berhasil di-trigger! Halaman akan diperbarui...');
+          setTimeout(() => location.reload(), 3000);
+        } else if (res.status === 422) {
+          // workflow_dispatch not present — show the inline hint
+          errEl.innerHTML = \`<strong>\${data.error}</strong><br><span class="text-white/60 text-xs">\${data.hint || ''}</span>\`;
+          errEl.classList.remove('hidden');
         } else {
           const msg = data.detail?.message || data.error || 'Unknown error';
-          errEl.textContent='Error: '+msg; errEl.classList.remove('hidden');
+          errEl.textContent = 'Error: ' + msg; errEl.classList.remove('hidden');
         }
-      } catch(e){errEl.textContent='Network error: '+e.message;errEl.classList.remove('hidden');}
-      finally{btn.disabled=false;btn.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Jalankan';}
+      } catch(e) { errEl.textContent = 'Network error: ' + e.message; errEl.classList.remove('hidden'); }
+      finally { btn.disabled = false; btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Jalankan'; }
     }
 
     // ── Run actions ──
