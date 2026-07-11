@@ -833,6 +833,32 @@ app.get('/api/github/*', async (c) => {
   return c.json(data, status as any)
 })
 
+// ==================== USER MANAGEMENT PAGE ====================
+app.get('/repo/:owner/:repo/users', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.redirect('/login')
+  const { owner, repo } = c.req.param()
+  const userCookie = getCookie(c, 'gh_user')
+  const user = userCookie ? JSON.parse(userCookie) : {}
+
+  const [repoRes, collabsRes, invitesRes] = await Promise.all([
+    githubApi(token, `/repos/${owner}/${repo}`),
+    githubApi(token, `/repos/${owner}/${repo}/collaborators?per_page=100&affiliation=all`),
+    githubApi(token, `/repos/${owner}/${repo}/invitations?per_page=50`),
+  ])
+
+  return c.html(userManagementPage(user, owner, repo, repoRes.data, collabsRes.data, invitesRes.data))
+})
+
+// API: Check single user's permission on this repo
+app.get('/repo/:owner/:repo/users/:username/permission', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+  const { owner, repo, username } = c.req.param()
+  const { status, data } = await githubApi(token, `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(username)}/permission`)
+  return c.json(data, status as any)
+})
+
 // ==================== PAGE TEMPLATES ====================
 function glassLayout(title: string, user: any, content: string, activeRepo?: string) {
   const userStr = user?.login ? `
@@ -903,6 +929,7 @@ function repoNav(owner: string, repo: string, active: string, repoData?: any) {
     { key: 'variables', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></svg> Variables', href: `/repo/${owner}/${repo}/settings/variables` },
     { key: 'webhooks', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/></svg> Webhooks', href: `/repo/${owner}/${repo}/settings/webhooks` },
     { key: 'collaborators', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> Collaborators', href: `/repo/${owner}/${repo}/settings/collaborators` },
+    { key: 'users', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg> User Management', href: `/repo/${owner}/${repo}/users` },
     { key: 'keys', label: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg> Deploy Keys', href: `/repo/${owner}/${repo}/settings/keys` },
   ]
   
@@ -3426,6 +3453,466 @@ async function sealedBoxAsync(message: Uint8Array, recipientPublicKey: Uint8Arra
 
 function escapeHtml(str: string): string {
   return str?.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;') || ''
+}
+
+// ==================== USER MANAGEMENT PAGE ====================
+function userManagementPage(user: any, owner: string, repo: string, repoData: any, collabs: any[], invites: any[]) {
+  const isError   = !Array.isArray(collabs)
+  const members   = isError ? [] : collabs
+  const pending   = Array.isArray(invites) ? invites : []
+
+  // Permission helpers
+  const PERMS = [
+    { value: 'pull',     label: 'Read',     desc: 'Lihat & clone repo',           color: '#94a3b8', bg: 'rgba(148,163,184,0.1)',  border: 'rgba(148,163,184,0.25)' },
+    { value: 'triage',   label: 'Triage',   desc: 'Kelola issues & PR',           color: '#a5b4fc', bg: 'rgba(165,180,252,0.1)',  border: 'rgba(165,180,252,0.25)' },
+    { value: 'push',     label: 'Write',    desc: 'Push & merge code',            color: '#86efac', bg: 'rgba(134,239,172,0.1)',  border: 'rgba(134,239,172,0.25)' },
+    { value: 'maintain', label: 'Maintain', desc: 'Kelola branch & settings',     color: '#d8b4fe', bg: 'rgba(216,180,254,0.1)',  border: 'rgba(216,180,254,0.25)' },
+    { value: 'admin',    label: 'Admin',    desc: 'Full kontrol repository',      color: '#fca5a5', bg: 'rgba(252,165,165,0.1)',  border: 'rgba(252,165,165,0.25)' },
+  ]
+
+  function getPerm(c: any): string {
+    if (c.role_name) return c.role_name
+    if (!c.permissions) return 'push'
+    if (c.permissions.admin)    return 'admin'
+    if (c.permissions.maintain) return 'maintain'
+    if (c.permissions.push)     return 'push'
+    if (c.permissions.triage)   return 'triage'
+    return 'pull'
+  }
+
+  function permInfo(val: string) {
+    return PERMS.find(p => p.value === val) || PERMS[2]
+  }
+
+  function permPill(val: string) {
+    const p = permInfo(val)
+    return `<span class="um-perm-pill" style="color:${p.color};background:${p.bg};border-color:${p.border}">${p.label}</span>`
+  }
+
+  // Owner card
+  const ownerHtml = `
+    <div class="um-member-row" id="um-owner">
+      <div class="um-member-avatar-wrap">
+        <img src="${escapeHtml(repoData?.owner?.avatar_url || '')}" class="um-member-avatar" />
+        <span class="um-role-dot um-dot-owner" title="Owner"></span>
+      </div>
+      <div class="um-member-main">
+        <div class="um-member-top">
+          <span class="um-member-login">${escapeHtml(repoData?.owner?.login || owner)}</span>
+          <span class="um-owner-badge">👑 Owner</span>
+        </div>
+        <div class="um-member-sub">Repository owner — full access cannot be modified</div>
+      </div>
+      <div class="um-member-actions">
+        <a href="https://github.com/${escapeHtml(repoData?.owner?.login || owner)}" target="_blank" class="um-action-btn um-btn-ghost">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+          GitHub
+        </a>
+      </div>
+    </div>`
+
+  // Collaborator rows
+  const collabRows = members
+    .filter((m: any) => m.login !== repoData?.owner?.login)
+    .map((m: any) => {
+      const perm = getPerm(m)
+      const pi   = permInfo(perm)
+      return `
+      <div class="um-member-row" id="um-${escapeHtml(m.login)}">
+        <div class="um-member-avatar-wrap">
+          <img src="${escapeHtml(m.avatar_url || '')}" class="um-member-avatar" />
+          <span class="um-role-dot ${m.type === 'Organization' ? 'um-dot-org' : 'um-dot-user'}" title="${escapeHtml(m.type || 'User')}"></span>
+        </div>
+        <div class="um-member-main">
+          <div class="um-member-top">
+            <span class="um-member-login">${escapeHtml(m.login)}</span>
+            ${permPill(perm)}
+          </div>
+          <div class="um-member-sub">${escapeHtml(m.type || 'User')} · ${pi.desc}</div>
+        </div>
+        <div class="um-member-actions">
+          <select class="um-perm-select" title="Ubah permission"
+            onchange="updateMemberPerm('${escapeHtml(m.login)}', this.value, this)">
+            ${PERMS.map(p => `<option value="${p.value}" ${perm === p.value ? 'selected' : ''}>${p.label}</option>`).join('')}
+          </select>
+          <a href="https://github.com/${escapeHtml(m.login)}" target="_blank" class="um-action-btn um-btn-ghost" title="Lihat profil GitHub">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+          </a>
+          <button class="um-action-btn um-btn-danger" title="Hapus akses" onclick="removeMember('${escapeHtml(m.login)}')">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+      </div>`
+    }).join('')
+
+  // Pending invitation rows
+  const pendingRows = pending.map((inv: any) => `
+    <div class="um-member-row um-pending-row" id="uminv-${inv.id}">
+      <div class="um-member-avatar-wrap">
+        <img src="${escapeHtml(inv.invitee?.avatar_url || '')}" class="um-member-avatar" style="opacity:.55" />
+        <span class="um-role-dot um-dot-pending" title="Pending"></span>
+      </div>
+      <div class="um-member-main">
+        <div class="um-member-top">
+          <span class="um-member-login" style="opacity:.7">${escapeHtml(inv.invitee?.login || '—')}</span>
+          <span class="um-pending-badge">⏳ Menunggu</span>
+        </div>
+        <div class="um-member-sub">
+          Undangan dikirim · ${permInfo(inv.permissions || 'push').label} access
+          · Expires ${inv.expires_at ? timeAgo(inv.expires_at) : 'in 7 days'}
+        </div>
+      </div>
+      <div class="um-member-actions">
+        <button class="um-action-btn um-btn-ghost" title="Kirim ulang / salin link"
+          onclick="copyInviteLink('${escapeHtml(inv.invitee?.login || '')}')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          Salin link
+        </button>
+        <button class="um-action-btn um-btn-danger" title="Batalkan undangan"
+          onclick="cancelInvite(${inv.id}, '${escapeHtml(inv.invitee?.login || '')}')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          Batalkan
+        </button>
+      </div>
+    </div>`).join('')
+
+  // Permission reference table
+  const permTableRows = PERMS.map(p => `
+    <tr>
+      <td><span class="um-perm-pill" style="color:${p.color};background:${p.bg};border-color:${p.border}">${p.label}</span></td>
+      <td>${p.desc}</td>
+      <td class="um-perm-caps">
+        ${p.value === 'pull'     ? 'Clone, pull, fork' : ''}
+        ${p.value === 'triage'   ? '+ Buka/tutup issues & PR, assign labels' : ''}
+        ${p.value === 'push'     ? '+ Push ke non-protected branch, merge PR' : ''}
+        ${p.value === 'maintain' ? '+ Kelola branch protection, push tag, edit deskripsi' : ''}
+        ${p.value === 'admin'    ? '+ Tambah/hapus collaborator, ubah visibility, hapus repo' : ''}
+      </td>
+    </tr>`).join('')
+
+  const totalMembers = members.filter((m: any) => m.login !== repoData?.owner?.login).length
+
+  const content = `
+    ${repoNav(owner, repo, 'users', repoData)}
+
+    <!-- Toast -->
+    <div id="um-toast" class="toast hidden"></div>
+
+    <!-- ── Header stats ─────────────────────────────────────────────────── -->
+    <div class="um-stats-bar">
+      <div class="um-stat">
+        <div class="um-stat-num">${totalMembers + 1}</div>
+        <div class="um-stat-label">Total Users</div>
+      </div>
+      <div class="um-stat">
+        <div class="um-stat-num">${totalMembers}</div>
+        <div class="um-stat-label">Collaborators</div>
+      </div>
+      <div class="um-stat" style="${pending.length > 0 ? 'color:#fde047' : ''}">
+        <div class="um-stat-num">${pending.length}</div>
+        <div class="um-stat-label">Pending</div>
+      </div>
+      <div class="um-stat">
+        <div class="um-stat-num">${repoData?.private ? '🔒' : '🌐'}</div>
+        <div class="um-stat-label">${repoData?.private ? 'Private' : 'Public'}</div>
+      </div>
+    </div>
+
+    <!-- ── Add User Panel ─────────────────────────────────────────────── -->
+    <div class="um-add-panel glass-card">
+      <div class="um-add-header">
+        <div class="um-add-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+        </div>
+        <div>
+          <div class="um-add-title">Tambah User Baru</div>
+          <div class="um-add-subtitle">Cari dan undang pengguna GitHub untuk mengelola repository ini</div>
+        </div>
+      </div>
+
+      <div class="um-add-form">
+        <!-- Search field -->
+        <div class="um-search-wrap">
+          <div class="um-search-icon">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          </div>
+          <input type="text" id="um-search-input" class="um-search-input"
+            placeholder="Cari username GitHub…"
+            autocomplete="off"
+            oninput="umSearchUsers(this.value)"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();umDoInvite()}" />
+          <div id="um-suggest" class="um-suggest hidden"></div>
+        </div>
+
+        <!-- Selected user preview -->
+        <div id="um-selected-preview" class="hidden">
+          <div class="um-selected-card" id="um-selected-card"></div>
+        </div>
+
+        <!-- Permission selector - full matrix style -->
+        <div class="um-perm-matrix" id="um-perm-matrix">
+          ${PERMS.map(p => `
+          <label class="um-perm-option" id="umopt-${p.value}">
+            <input type="radio" name="um_perm" value="${p.value}" ${p.value === 'push' ? 'checked' : ''}>
+            <div class="um-perm-card" style="--perm-color:${p.color};--perm-bg:${p.bg};--perm-border:${p.border}">
+              <div class="um-perm-card-label">${p.label}</div>
+              <div class="um-perm-card-desc">${p.desc}</div>
+            </div>
+          </label>`).join('')}
+        </div>
+
+        <button class="um-invite-btn" id="um-invite-btn" onclick="umDoInvite()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+          Kirim Undangan
+        </button>
+        <div id="um-invite-error" class="um-invite-error hidden"></div>
+      </div>
+    </div>
+
+    <!-- ── Pending Invitations ────────────────────────────────────────── -->
+    ${pending.length > 0 ? `
+    <div class="um-section">
+      <div class="um-section-header">
+        <div class="um-section-title">
+          <span class="um-section-dot um-dot-pending"></span>
+          Undangan Tertunda
+          <span class="um-count-badge" style="background:rgba(234,179,8,.15);color:#fde047;border-color:rgba(234,179,8,.3)">${pending.length}</span>
+        </div>
+        <div class="um-section-hint">User belum menerima undangan</div>
+      </div>
+      <div class="um-members-list" id="um-pending-list">${pendingRows}</div>
+    </div>` : ''}
+
+    <!-- ── Active Members ─────────────────────────────────────────────── -->
+    <div class="um-section">
+      <div class="um-section-header">
+        <div class="um-section-title">
+          <span class="um-section-dot um-dot-user"></span>
+          Anggota Aktif
+          <span class="um-count-badge">${totalMembers + 1}</span>
+        </div>
+        <input type="text" class="um-filter-input" placeholder="🔍 Filter nama…" oninput="umFilter(this.value)">
+      </div>
+      ${isError
+        ? `<div class="um-error-box">⚠ Gagal memuat daftar user. Token perlu scope <code>repo</code> dan akses <strong>admin</strong> ke repository ini.</div>`
+        : `<div class="um-members-list" id="um-members-list">
+             ${ownerHtml}
+             ${collabRows || '<div class="um-empty">Belum ada collaborator selain owner.</div>'}
+           </div>`
+      }
+    </div>
+
+    <!-- ── Permission Reference ───────────────────────────────────────── -->
+    <div class="um-section">
+      <div class="um-section-header" onclick="togglePermRef()" style="cursor:pointer">
+        <div class="um-section-title">
+          📋 Referensi Permission
+          <span id="permRefChevron" style="margin-left:6px;transition:transform .2s;display:inline-block">▼</span>
+        </div>
+        <div class="um-section-hint">Klik untuk tampilkan/sembunyikan</div>
+      </div>
+      <div id="permRefTable" class="hidden">
+        <table class="um-perm-table">
+          <thead><tr><th>Level</th><th>Deskripsi</th><th>Kemampuan</th></tr></thead>
+          <tbody>${permTableRows}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <script>
+    const OWNER = '${escapeHtml(owner)}', REPO = '${escapeHtml(repo)}';
+    let umSearchTimer = null, umSelectedUser = null;
+
+    // ── Toast ──────────────────────────────────────────────────────────────
+    function umToast(msg, type = 'success') {
+      const t = document.getElementById('um-toast');
+      t.textContent = msg;
+      t.className = 'toast ' + (type === 'success' ? 'toast-success' : 'toast-error');
+      t.classList.remove('hidden');
+      clearTimeout(t._tid);
+      t._tid = setTimeout(() => t.classList.add('hidden'), 4500);
+    }
+
+    // ── User search autocomplete ───────────────────────────────────────────
+    function umSearchUsers(q) {
+      clearTimeout(umSearchTimer);
+      const box = document.getElementById('um-suggest');
+      if (!q || q.length < 2) { box.classList.add('hidden'); umClearSelected(); return; }
+      umSearchTimer = setTimeout(async () => {
+        try {
+          const res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
+          const data = await res.json();
+          const items = data.items || [];
+          if (!items.length) { box.classList.add('hidden'); return; }
+          box.innerHTML = items.map(u => \`
+            <div class="um-suggest-item" onclick="umSelectUser(\${JSON.stringify(u)})">
+              <img src="\${u.avatar_url}" class="um-suggest-avatar" />
+              <div class="um-suggest-info">
+                <div class="um-suggest-login">\${u.login}</div>
+                <div class="um-suggest-type">\${u.type || 'User'}</div>
+              </div>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.3)" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+            </div>
+          \`).join('');
+          box.classList.remove('hidden');
+        } catch(e) { box.classList.add('hidden'); }
+      }, 280);
+    }
+
+    function umSelectUser(u) {
+      umSelectedUser = u;
+      document.getElementById('um-search-input').value = u.login;
+      document.getElementById('um-suggest').classList.add('hidden');
+      // Show preview card
+      document.getElementById('um-selected-card').innerHTML = \`
+        <img src="\${u.avatar_url}" class="um-sel-avatar" />
+        <div class="um-sel-info">
+          <div class="um-sel-login">\${u.login}</div>
+          <div class="um-sel-type">\${u.type || 'User'}</div>
+        </div>
+        <button class="um-sel-clear" onclick="umClearSelected()" title="Hapus pilihan">✕</button>
+      \`;
+      document.getElementById('um-selected-preview').classList.remove('hidden');
+    }
+
+    function umClearSelected() {
+      umSelectedUser = null;
+      document.getElementById('um-selected-preview').classList.add('hidden');
+      document.getElementById('um-selected-card').innerHTML = '';
+    }
+
+    // Close suggest on outside click
+    document.addEventListener('click', e => {
+      if (!e.target.closest('.um-search-wrap'))
+        document.getElementById('um-suggest').classList.add('hidden');
+    });
+
+    // ── Invite user ────────────────────────────────────────────────────────
+    async function umDoInvite() {
+      const input    = document.getElementById('um-search-input').value.trim();
+      const username = (umSelectedUser?.login || input).trim();
+      const perm     = document.querySelector('input[name="um_perm"]:checked')?.value || 'push';
+      const errEl    = document.getElementById('um-invite-error');
+      const btn      = document.getElementById('um-invite-btn');
+
+      errEl.classList.add('hidden');
+      if (!username) {
+        errEl.textContent = '⚠ Masukkan atau pilih username GitHub terlebih dahulu.';
+        errEl.classList.remove('hidden'); return;
+      }
+
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spin">⟳</span> Mengirim undangan…';
+
+      try {
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/settings/collaborators/\${encodeURIComponent(username)}\`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ permission: perm })
+        });
+        const d = await res.json();
+        if (d.success) {
+          if (d.status === 'already_collab') {
+            umToast(\`✓ \${username} sudah menjadi collaborator repository ini.\`);
+          } else {
+            umToast(\`✉ Undangan berhasil dikirim ke \${username}!\`);
+            document.getElementById('um-search-input').value = '';
+            umClearSelected();
+            setTimeout(() => location.reload(), 1800);
+          }
+        } else {
+          const msg = d.error || 'Terjadi kesalahan';
+          errEl.innerHTML = \`⚠ \${msg}\`;
+          errEl.classList.remove('hidden');
+        }
+      } catch(e) {
+        errEl.textContent = 'Network error: ' + e.message;
+        errEl.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg> Kirim Undangan';
+      }
+    }
+
+    // ── Update member permission ───────────────────────────────────────────
+    async function updateMemberPerm(username, perm, selectEl) {
+      try {
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/settings/collaborators/\${encodeURIComponent(username)}\`, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ permission: perm })
+        });
+        const d = await res.json();
+        if (d.success) {
+          umToast(\`✓ Permission \${username} diperbarui menjadi \${perm}\`);
+          // Update the pill badge
+          const row = document.getElementById('um-' + username);
+          if (row) {
+            const PERM_DATA = ${JSON.stringify(PERMS)};
+            const pi = PERM_DATA.find(p => p.value === perm) || PERM_DATA[2];
+            const pill = row.querySelector('.um-perm-pill');
+            if (pill) { pill.textContent = pi.label; pill.style.color = pi.color; pill.style.background = pi.bg; pill.style.borderColor = pi.border; }
+            const sub = row.querySelector('.um-member-sub');
+            if (sub) sub.textContent = (pi.value === 'pull' ? 'User' : 'User') + ' · ' + pi.desc;
+          }
+        } else {
+          umToast('Gagal: ' + (d.error || ''), 'error');
+          if (selectEl) { /* revert handled by browser */ }
+        }
+      } catch(e) { umToast('Network error', 'error'); }
+    }
+
+    // ── Remove member ──────────────────────────────────────────────────────
+    async function removeMember(username) {
+      if (!confirm(\`Hapus akses \${username} dari repository ini?\nMereka tidak bisa lagi push, pull (private), atau mengelola repo.\`)) return;
+      try {
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/settings/collaborators/\${encodeURIComponent(username)}\`, { method: 'DELETE' });
+        const d = await res.json();
+        if (d.success) {
+          umToast(\`✓ Akses \${username} telah dicabut.\`);
+          document.getElementById('um-' + username)?.remove();
+        } else umToast('Gagal: ' + (d.error || ''), 'error');
+      } catch(e) { umToast('Network error', 'error'); }
+    }
+
+    // ── Cancel invitation ─────────────────────────────────────────────────
+    async function cancelInvite(invId, login) {
+      if (!confirm(\`Batalkan undangan untuk \${login}?\`)) return;
+      try {
+        const res = await fetch(\`/repo/\${OWNER}/\${REPO}/settings/invitations/\${invId}\`, { method: 'DELETE' });
+        const d = await res.json();
+        if (d.success) {
+          umToast(\`✓ Undangan untuk \${login} dibatalkan.\`);
+          document.getElementById('uminv-' + invId)?.remove();
+        } else umToast('Gagal: ' + (d.error || ''), 'error');
+      } catch(e) { umToast('Network error', 'error'); }
+    }
+
+    // ── Copy invite link (fallback — open GitHub profile) ─────────────────
+    function copyInviteLink(login) {
+      const url = \`https://github.com/\${OWNER}/\${REPO}/invitations\`;
+      navigator.clipboard?.writeText(url).then(() => umToast('✓ Link undangan disalin!')).catch(() => window.open(url, '_blank'));
+    }
+
+    // ── Filter members list ────────────────────────────────────────────────
+    function umFilter(q) {
+      const ql = q.toLowerCase();
+      document.querySelectorAll('#um-members-list .um-member-row').forEach(el => {
+        const login = el.querySelector('.um-member-login')?.textContent?.toLowerCase() || '';
+        el.style.display = !q || login.includes(ql) ? '' : 'none';
+      });
+    }
+
+    // ── Permission reference toggle ────────────────────────────────────────
+    function togglePermRef() {
+      const t = document.getElementById('permRefTable');
+      const c = document.getElementById('permRefChevron');
+      const open = !t.classList.contains('hidden');
+      t.classList.toggle('hidden', open);
+      c.style.transform = open ? '' : 'rotate(180deg)';
+    }
+    </script>
+  `
+  return glassLayout(`User Management — ${repo}`, user, content)
 }
 
 function formatBytes(bytes: number): string {
