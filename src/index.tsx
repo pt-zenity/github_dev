@@ -887,27 +887,74 @@ app.get('/repo/:owner/:repo/downloads/runs/:runId/artifacts', async (c) => {
   return c.json(data, status as any)
 })
 
-// API: get artifact download redirect URL (GitHub returns 302 to Azure blob)
+// API: stream artifact ZIP directly (no redirect to Azure blob)
 app.get('/repo/:owner/:repo/downloads/artifact/:artifactId', async (c) => {
   const token = getToken(c)
   if (!token) return c.json({ error: 'Unauthorized' }, 401)
   const { owner, repo, artifactId } = c.req.param()
-  // GitHub API: GET /repos/{owner}/{repo}/actions/artifacts/{id}/zip
-  // Returns 302 → Azure blob URL (short-lived). We proxy the Location header back.
+  const filename = c.req.query('filename') || `artifact-${artifactId}.zip`
+
+  // Step 1: follow redirect to Azure blob URL in one hop
   const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/artifacts/${artifactId}/zip`, {
     headers: {
       'Authorization': `Bearer ${token}`,
       'Accept': 'application/vnd.github+json',
       'User-Agent': 'GitManager/1.0',
     },
-    redirect: 'manual',
+    redirect: 'follow',
   })
-  if (resp.status === 302) {
-    const location = resp.headers.get('location')
-    if (location) return c.redirect(location, 302)
+  if (!resp.ok || !resp.body) {
+    return c.json({ error: `GitHub returned ${resp.status}` }, resp.status as any)
   }
-  const { status, data } = await githubApi(token, `/repos/${owner}/${repo}/actions/artifacts/${artifactId}/zip`)
-  return c.json({ error: 'Could not get download URL', status }, 502)
+  return new Response(resp.body, {
+    headers: {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Cache-Control': 'no-store',
+    }
+  })
+})
+
+// Generic proxy: stream any GitHub file URL (archive, release asset, raw file)
+// Usage: GET /repo/:owner/:repo/downloads/proxy?url=<encoded-url>&filename=<name>
+app.get('/repo/:owner/:repo/downloads/proxy', async (c) => {
+  const token = getToken(c)
+  if (!token) return c.json({ error: 'Unauthorized' }, 401)
+
+  const rawUrl  = c.req.query('url') || ''
+  const filename = c.req.query('filename') || 'download'
+
+  // Only allow GitHub / codeload domains
+  let parsedUrl: URL
+  try { parsedUrl = new URL(rawUrl) } catch { return c.json({ error: 'Invalid URL' }, 400) }
+  const allowedHosts = ['github.com', 'codeload.github.com', 'objects.githubusercontent.com', 'releases.githubusercontent.com']
+  if (!allowedHosts.some(h => parsedUrl.hostname === h || parsedUrl.hostname.endsWith('.' + h))) {
+    return c.json({ error: 'URL not allowed' }, 403)
+  }
+
+  const resp = await fetch(rawUrl, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'User-Agent': 'GitManager/1.0',
+    },
+    redirect: 'follow',
+  })
+  if (!resp.ok || !resp.body) {
+    return c.json({ error: `Upstream returned ${resp.status}` }, resp.status as any)
+  }
+
+  // Detect content-type from upstream or guess from filename
+  const ct = resp.headers.get('content-type') || guessContentType(filename)
+  const cd = `attachment; filename="${filename}"`
+  const headers: Record<string, string> = {
+    'Content-Type': ct,
+    'Content-Disposition': cd,
+    'Cache-Control': 'no-store',
+  }
+  const cl = resp.headers.get('content-length')
+  if (cl) headers['Content-Length'] = cl
+
+  return new Response(resp.body, { headers })
 })
 
 // ==================== PAGE TEMPLATES ====================
@@ -3504,12 +3551,15 @@ async function sealedBoxAsync(message: Uint8Array, recipientPublicKey: Uint8Arra
 }
 
 // ==================== DOWNLOAD CENTER PAGE ====================
+function dlProxyUrl(owner: string, repo: string, fileUrl: string, filename: string): string {
+  return `/repo/${owner}/${repo}/downloads/proxy?url=${encodeURIComponent(fileUrl)}&filename=${encodeURIComponent(filename)}`
+}
+
 function downloadPage(user: any, owner: string, repo: string, repoData: any, releases: any[], branches: any[], tags: any[], runsData: any) {
-  const repoErr = !repoData || repoData.message
-  const relItems  = Array.isArray(releases) ? releases : []
-  const brItems   = Array.isArray(branches) ? branches : []
-  const tagItems  = Array.isArray(tags) ? tags : []
-  const runs      = Array.isArray(runsData?.workflow_runs) ? runsData.workflow_runs : []
+  const relItems      = Array.isArray(releases) ? releases : []
+  const brItems       = Array.isArray(branches) ? branches : []
+  const tagItems      = Array.isArray(tags) ? tags : []
+  const runs          = Array.isArray(runsData?.workflow_runs) ? runsData.workflow_runs : []
   const defaultBranch = repoData?.default_branch || 'main'
   const OWNER = escapeHtml(owner), REPO = escapeHtml(repo)
 
@@ -3517,9 +3567,12 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
   const releaseSection = relItems.length === 0
     ? `<div class="dl-empty"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><p>Belum ada releases</p></div>`
     : relItems.map((r: any) => {
-        const assets = Array.isArray(r.assets) ? r.assets : []
-        const srcZip = `https://github.com/${owner}/${repo}/archive/refs/tags/${r.tag_name}.zip`
-        const srcTar = `https://github.com/${owner}/${repo}/archive/refs/tags/${r.tag_name}.tar.gz`
+        const assets    = Array.isArray(r.assets) ? r.assets : []
+        const tagEnc    = encodeURIComponent(r.tag_name)
+        const srcZipUrl = `https://codeload.github.com/${owner}/${repo}/zip/refs/tags/${tagEnc}`
+        const srcTarUrl = `https://codeload.github.com/${owner}/${repo}/legacy.tar.gz/refs/tags/${tagEnc}`
+        const srcZipFn  = `${repo}-${r.tag_name}.zip`
+        const srcTarFn  = `${repo}-${r.tag_name}.tar.gz`
         return `
         <div class="dl-release-card">
           <div class="dl-release-header">
@@ -3535,12 +3588,12 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
             <div class="dl-asset-row dl-asset-src">
               <div class="dl-asset-icon">🗜️</div>
               <div class="dl-asset-info"><span class="dl-asset-name">Source code (zip)</span><span class="dl-asset-size">auto</span></div>
-              <a href="${srcZip}" class="dl-btn" download>⬇ ZIP</a>
+              <a href="${dlProxyUrl(owner, repo, srcZipUrl, srcZipFn)}" class="dl-btn" download="${escapeHtml(srcZipFn)}">⬇ ZIP</a>
             </div>
             <div class="dl-asset-row dl-asset-src">
               <div class="dl-asset-icon">🗜️</div>
               <div class="dl-asset-info"><span class="dl-asset-name">Source code (tar.gz)</span><span class="dl-asset-size">auto</span></div>
-              <a href="${srcTar}" class="dl-btn" download>⬇ TAR</a>
+              <a href="${dlProxyUrl(owner, repo, srcTarUrl, srcTarFn)}" class="dl-btn" download="${escapeHtml(srcTarFn)}">⬇ TAR</a>
             </div>
             ${assets.map((a: any) => `
             <div class="dl-asset-row">
@@ -3549,7 +3602,7 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
                 <span class="dl-asset-name" title="${escapeHtml(a.name)}">${escapeHtml(a.name)}</span>
                 <span class="dl-asset-size">${formatBytes(a.size)} · ${(a.download_count||0).toLocaleString()} downloads</span>
               </div>
-              <a href="${escapeHtml(a.browser_download_url)}" class="dl-btn" download>⬇ Download</a>
+              <a href="${dlProxyUrl(owner, repo, a.browser_download_url, a.name)}" class="dl-btn" download="${escapeHtml(a.name)}">⬇ Download</a>
             </div>`).join('')}
           </div>
         </div>`
@@ -3557,18 +3610,20 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
 
   // ---- Source archive section (branches + tags) ----
   const allRefs = [
-    ...brItems.map((b: any) => ({ name: b.name, type: 'branch', sha: b.commit?.sha?.substring(0,7) })),
-    ...tagItems.map((t: any) => ({ name: t.name, type: 'tag', sha: t.commit?.sha?.substring(0,7) })),
+    ...brItems.map((b: any)  => ({ name: b.name, type: 'branch', sha: b.commit?.sha?.substring(0,7) })),
+    ...tagItems.map((t: any) => ({ name: t.name, type: 'tag',    sha: t.commit?.sha?.substring(0,7) })),
   ]
 
   const sourceRows = allRefs.map((ref: any) => {
-    const encName = encodeURIComponent(ref.name)
-    const zipUrl  = `https://github.com/${owner}/${repo}/archive/refs/heads/${encName}.zip`
-    const tarUrl  = `https://github.com/${owner}/${repo}/archive/refs/heads/${encName}.tar.gz`
-    const zipTagUrl  = `https://github.com/${owner}/${repo}/archive/refs/tags/${encName}.zip`
-    const tarTagUrl  = `https://github.com/${owner}/${repo}/archive/refs/tags/${encName}.tar.gz`
-    const finalZip = ref.type === 'tag' ? zipTagUrl : zipUrl
-    const finalTar = ref.type === 'tag' ? tarTagUrl : tarUrl
+    const encName   = encodeURIComponent(ref.name)
+    const zipRawUrl = ref.type === 'tag'
+      ? `https://codeload.github.com/${owner}/${repo}/zip/refs/tags/${encName}`
+      : `https://codeload.github.com/${owner}/${repo}/zip/refs/heads/${encName}`
+    const tarRawUrl = ref.type === 'tag'
+      ? `https://codeload.github.com/${owner}/${repo}/legacy.tar.gz/refs/tags/${encName}`
+      : `https://codeload.github.com/${owner}/${repo}/legacy.tar.gz/refs/heads/${encName}`
+    const zipFn = `${repo}-${ref.name}.zip`
+    const tarFn = `${repo}-${ref.name}.tar.gz`
     return `
     <div class="dl-ref-row" data-ref-type="${ref.type}">
       <div class="dl-ref-icon">${ref.type === 'branch' ? '🌿' : '🏷️'}</div>
@@ -3577,8 +3632,8 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
         <span class="dl-ref-sha">${ref.type} · ${ref.sha || ''}</span>
       </div>
       <div class="dl-ref-btns">
-        <a href="${finalZip}" class="dl-btn dl-btn-sm" download title="Download ZIP">⬇ ZIP</a>
-        <a href="${finalTar}" class="dl-btn dl-btn-sm dl-btn-ghost" download title="Download TAR.GZ">⬇ TAR</a>
+        <a href="${dlProxyUrl(owner, repo, zipRawUrl, zipFn)}" class="dl-btn dl-btn-sm" download="${escapeHtml(zipFn)}" title="Download ZIP">⬇ ZIP</a>
+        <a href="${dlProxyUrl(owner, repo, tarRawUrl, tarFn)}" class="dl-btn dl-btn-sm dl-btn-ghost" download="${escapeHtml(tarFn)}" title="Download TAR.GZ">⬇ TAR</a>
       </div>
     </div>`
   }).join('')
@@ -3602,7 +3657,7 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
     ${repoNav(owner, repo, 'downloads', repoData)}
     <div class="dl-page">
 
-      <!-- Header stats bar -->
+      <!-- Stats bar -->
       <div class="dl-stats-bar">
         <div class="dl-stat">
           <div class="dl-stat-val">${relItems.length}</div>
@@ -3623,19 +3678,19 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
       </div>
 
       <!-- Tab nav -->
-      <div class="dl-tabs" id="dlTabs">
+      <div class="dl-tabs">
         <button class="dl-tab active" onclick="dlSwitch('releases', this)">📦 Release Assets</button>
         <button class="dl-tab" onclick="dlSwitch('source', this)">🗜️ Source Archives</button>
         <button class="dl-tab" onclick="dlSwitch('artifacts', this)">⚡ Workflow Artifacts</button>
         <button class="dl-tab" onclick="dlSwitch('file', this)">📄 File Finder</button>
       </div>
 
-      <!-- Tab: Release Assets -->
+      <!-- Release Assets -->
       <div class="dl-panel active" id="dl-releases">
         ${releaseSection}
       </div>
 
-      <!-- Tab: Source Archives -->
+      <!-- Source Archives -->
       <div class="dl-panel" id="dl-source">
         <div class="dl-filter-row">
           <input id="refFilter" class="dl-filter-input" placeholder="🔍 Filter branch / tag..." oninput="filterRefs(this.value)" />
@@ -3647,29 +3702,31 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
         </div>
       </div>
 
-      <!-- Tab: Workflow Artifacts -->
+      <!-- Workflow Artifacts -->
       <div class="dl-panel" id="dl-artifacts">
-        <p class="dl-hint">Klik tombol <strong>Artifacts</strong> di bawah untuk melihat artifact dari setiap run. Artifact diunduh sebagai file ZIP.</p>
+        <p class="dl-hint">Klik <strong>Artifacts</strong> untuk melihat artifact tiap run. File diunduh langsung tanpa berpindah halaman.</p>
         <div id="runList">
           ${artifactRunRows}
         </div>
       </div>
 
-      <!-- Tab: File Finder -->
+      <!-- File Finder -->
       <div class="dl-panel" id="dl-file">
         <div class="dl-file-search-wrap">
           <div class="dl-file-search-row">
-            <div class="dl-file-branch-wrap">
-              <select id="fileBranch" class="dl-branch-select">
-                ${[defaultBranch, ...brItems.filter((b: any) => b.name !== defaultBranch).map((b: any) => b.name)].map((n: string) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')}
-              </select>
-            </div>
-            <input id="filePathInput" class="dl-file-path-input" placeholder="Path file, mis: src/index.tsx" />
+            <select id="fileBranch" class="dl-branch-select">
+              ${[defaultBranch, ...brItems.filter((b: any) => b.name !== defaultBranch).map((b: any) => b.name)]
+                .map((n: string) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')}
+            </select>
+            <input id="filePathInput" class="dl-file-path-input" placeholder="Path file, mis: src/index.tsx"
+              onkeydown="if(event.key==='Enter')fetchFile()" />
             <button class="dl-btn" onclick="fetchFile()">🔍 Cari</button>
           </div>
-          <p class="dl-hint" style="margin-top:8px">Masukkan path file di repo, lalu klik Cari untuk mendapatkan link download langsung.</p>
+          <p class="dl-hint" style="margin-top:8px">Masukkan path file, tekan Enter atau klik Cari. Klik <strong>⬇ Download</strong> untuk mengunduh langsung.</p>
         </div>
-        <div id="fileResult" style="margin-top:16px"></div>
+        <!-- Breadcrumb path -->
+        <div id="fileBreadcrumb" class="dl-breadcrumb" style="display:none"></div>
+        <div id="fileResult" style="margin-top:12px"></div>
       </div>
 
     </div><!-- /.dl-page -->
@@ -3677,7 +3734,6 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
     <script>
     const DL_OWNER = '${OWNER}', DL_REPO = '${REPO}';
 
-    // Tab switcher
     function dlSwitch(tab, btn) {
       document.querySelectorAll('.dl-tab').forEach(b => b.classList.remove('active'));
       document.querySelectorAll('.dl-panel').forEach(p => p.classList.remove('active'));
@@ -3685,7 +3741,6 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
       document.getElementById('dl-' + tab).classList.add('active');
     }
 
-    // Source archive filter
     function filterRefs(val) {
       const q = (val ?? document.getElementById('refFilter').value).toLowerCase();
       const showBr = document.getElementById('showBranch').checked;
@@ -3698,28 +3753,31 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
       });
     }
 
-    // Load artifacts for a run
+    // Load artifacts — download link goes through our proxy
     async function loadArtifacts(runId, btn) {
       const panel = document.getElementById('artifacts-' + runId);
       if (panel.style.display !== 'none') { panel.style.display = 'none'; btn.textContent = '📦 Artifacts'; return; }
       btn.textContent = '⏳ Loading...'; btn.disabled = true;
       try {
-        const res = await fetch(\`/repo/\${DL_OWNER}/\${DL_REPO}/downloads/runs/\${runId}/artifacts\`);
+        const res  = await fetch(\`/repo/\${DL_OWNER}/\${DL_REPO}/downloads/runs/\${runId}/artifacts\`);
         const data = await res.json();
         const arts = data.artifacts || [];
         if (arts.length === 0) {
           panel.innerHTML = '<div class="dl-artifact-empty">Tidak ada artifact di run ini</div>';
         } else {
-          panel.innerHTML = arts.map(a => \`
-            <div class="dl-artifact-row">
-              <div class="dl-artifact-icon">📦</div>
-              <div class="dl-artifact-info">
-                <span class="dl-artifact-name">\${a.name}</span>
-                <span class="dl-artifact-meta">\${formatBytesJS(a.size_in_bytes)} · Expires \${a.expires_at ? new Date(a.expires_at).toLocaleDateString() : 'unknown'}</span>
+          panel.innerHTML = arts.map(a => {
+            const proxyUrl = \`/repo/\${DL_OWNER}/\${DL_REPO}/downloads/artifact/\${a.id}?filename=\${encodeURIComponent(a.name + '.zip')}\`;
+            return \`
+              <div class="dl-artifact-row">
+                <div class="dl-artifact-icon">📦</div>
+                <div class="dl-artifact-info">
+                  <span class="dl-artifact-name">\${a.name}</span>
+                  <span class="dl-artifact-meta">\${formatBytesJS(a.size_in_bytes)} · Expires \${a.expires_at ? new Date(a.expires_at).toLocaleDateString('id-ID') : 'unknown'}</span>
+                </div>
+                <a href="\${proxyUrl}" class="dl-btn dl-btn-sm" download="\${a.name}.zip">⬇ Download</a>
               </div>
-              <a href="/repo/\${DL_OWNER}/\${DL_REPO}/downloads/artifact/\${a.id}" class="dl-btn dl-btn-sm">⬇ Download</a>
-            </div>
-          \`).join('');
+            \`;
+          }).join('');
         }
         panel.style.display = 'block';
       } catch(e) {
@@ -3729,58 +3787,83 @@ function downloadPage(user: any, owner: string, repo: string, repoData: any, rel
       btn.textContent = '📦 Hide'; btn.disabled = false;
     }
 
-    // File finder
-    async function fetchFile() {
+    // File Finder — proxy download link built client-side
+    let _currentBranch = '${escapeHtml(defaultBranch)}';
+
+    async function fetchFile(pathOverride) {
       const branch = document.getElementById('fileBranch').value.trim();
-      const path   = document.getElementById('filePathInput').value.trim();
+      _currentBranch = branch;
+      const path = pathOverride ?? document.getElementById('filePathInput').value.trim();
+      if (!pathOverride) document.getElementById('filePathInput').value = path;
       const result = document.getElementById('fileResult');
-      if (!path) { result.innerHTML = '<div class="dl-artifact-empty" style="color:#fbbf24">Masukkan path file terlebih dahulu</div>'; return; }
-      result.innerHTML = '<div class="dl-artifact-empty">⏳ Mencari file...</div>';
+      const crumb  = document.getElementById('fileBreadcrumb');
+      if (!path && path !== '') { result.innerHTML = '<div class="dl-artifact-empty" style="color:#fbbf24">Masukkan path file atau folder</div>'; return; }
+      result.innerHTML = '<div class="dl-artifact-empty"><span class="dl-spinner"></span> Mencari...</div>';
+
+      // Build breadcrumb
+      const parts = path ? path.split('/').filter(Boolean) : [];
+      crumb.style.display = parts.length ? 'flex' : 'none';
+      crumb.innerHTML = \`<span class="dl-bc-item" onclick="fetchFile('')" style="cursor:pointer">📁 root</span>\`
+        + parts.map((p, i) => {
+            const subPath = parts.slice(0, i+1).join('/');
+            return \`<span class="dl-bc-sep">›</span><span class="dl-bc-item" onclick="fetchFile('\${subPath}')" style="cursor:pointer">\${p}</span>\`;
+          }).join('');
+
       try {
-        const res  = await fetch(\`/api/github/repos/\${DL_OWNER}/\${DL_REPO}/contents/\${encodeURIComponent(path)}?ref=\${encodeURIComponent(branch)}\`);
+        const apiPath = path ? encodeURIComponent(path) : '';
+        const res  = await fetch(\`/api/github/repos/\${DL_OWNER}/\${DL_REPO}/contents/\${apiPath}?ref=\${encodeURIComponent(branch)}\`);
         const data = await res.json();
         if (data.message) { result.innerHTML = \`<div class="dl-artifact-empty" style="color:#f87171">❌ \${data.message}</div>\`; return; }
+
         if (data.type === 'file') {
-          const sizeStr = formatBytesJS(data.size);
+          // proxy URL — server fetches raw file using token
+          const proxyUrl = \`/repo/\${DL_OWNER}/\${DL_REPO}/downloads/proxy?url=\${encodeURIComponent(data.download_url)}&filename=\${encodeURIComponent(data.name)}\`;
           result.innerHTML = \`
             <div class="dl-file-result-card">
               <div class="dl-file-result-icon">\${getFileIconJS(data.name)}</div>
               <div class="dl-file-result-info">
                 <span class="dl-file-result-name">\${data.name}</span>
-                <span class="dl-file-result-meta">\${data.path} · \${sizeStr}</span>
+                <span class="dl-file-result-meta">\${data.path} · \${formatBytesJS(data.size)}</span>
               </div>
               <div class="dl-file-result-btns">
-                \${data.download_url ? \`<a href="\${data.download_url}" class="dl-btn" download>⬇ Download Raw</a>\` : ''}
-                <a href="\${data.html_url}" target="_blank" class="dl-btn dl-btn-ghost">📄 View on GitHub</a>
+                <a href="\${proxyUrl}" class="dl-btn" download="\${data.name}">⬇ Download</a>
+                <a href="\${data.html_url}" target="_blank" class="dl-btn dl-btn-ghost">📄 GitHub</a>
               </div>
             </div>
           \`;
         } else if (Array.isArray(data)) {
+          const dirs  = data.filter(f => f.type === 'dir').sort((a,b) => a.name.localeCompare(b.name));
+          const files = data.filter(f => f.type === 'file').sort((a,b) => a.name.localeCompare(b.name));
+          const items = [...dirs, ...files];
           result.innerHTML = \`
             <div class="dl-dir-result">
-              <div class="dl-dir-header">📁 Direktori · \${data.length} item</div>
+              <div class="dl-dir-header">📁 \${path || 'root'} · \${items.length} item</div>
               <div class="dl-dir-list">
-                \${data.map(f => \`
-                  <div class="dl-dir-item" onclick="selectDirItem('\${f.path}')">
-                    <span>\${f.type === 'dir' ? '📁' : getFileIconJS(f.name)}</span>
-                    <span class="dl-dir-item-name">\${f.name}</span>
-                    <span class="dl-dir-item-size">\${f.type === 'file' ? formatBytesJS(f.size) : ''}</span>
-                    \${f.type === 'file' && f.download_url ? \`<a href="\${f.download_url}" class="dl-btn dl-btn-sm" download>⬇</a>\` : ''}
-                  </div>
-                \`).join('')}
+                \${path ? \`<div class="dl-dir-item" onclick="fetchFile('\${path.split('/').slice(0,-1).join('/')}')">
+                  <span>⬆️</span><span class="dl-dir-item-name" style="color:rgba(255,255,255,0.4)">.. (naik)</span></div>\` : ''}
+                \${items.map(f => {
+                  const proxyUrl = f.type === 'file' && f.download_url
+                    ? \`/repo/\${DL_OWNER}/\${DL_REPO}/downloads/proxy?url=\${encodeURIComponent(f.download_url)}&filename=\${encodeURIComponent(f.name)}\`
+                    : '';
+                  return \`
+                    <div class="dl-dir-item" onclick="fetchFile('\${f.path}')">
+                      <span>\${f.type === 'dir' ? '📁' : getFileIconJS(f.name)}</span>
+                      <span class="dl-dir-item-name">\${f.name}</span>
+                      <span class="dl-dir-item-size">\${f.type === 'file' ? formatBytesJS(f.size) : ''}</span>
+                      \${proxyUrl ? \`<a href="\${proxyUrl}" class="dl-btn dl-btn-sm" download="\${f.name}" onclick="event.stopPropagation()">⬇</a>\` : ''}
+                    </div>\`;
+                }).join('')}
               </div>
             </div>
           \`;
         }
       } catch(e) {
-        result.innerHTML = '<div class="dl-artifact-empty" style="color:#f87171">Gagal mengambil file</div>';
+        result.innerHTML = '<div class="dl-artifact-empty" style="color:#f87171">Gagal mengambil data</div>';
       }
     }
 
-    function selectDirItem(path) {
-      document.getElementById('filePathInput').value = path;
-      fetchFile();
-    }
+    // Init file finder — show root directory
+    document.addEventListener('DOMContentLoaded', () => {});
 
     function formatBytesJS(bytes) {
       if (!bytes) return '0 B';
@@ -3803,6 +3886,21 @@ function getAssetIcon(name: string): string {
   const ext = (name || '').split('.').pop()?.toLowerCase() || ''
   const map: Record<string, string> = { zip:'🗜️', gz:'🗜️', tar:'🗜️', '7z':'🗜️', rar:'🗜️', exe:'⚙️', dmg:'🍎', pkg:'📦', deb:'🐧', rpm:'🐧', apk:'🤖', ipa:'📱', js:'🟨', ts:'🔷', py:'🐍', md:'📝', txt:'📄', pdf:'📕', png:'🖼️', jpg:'🖼️', svg:'🎨' }
   return map[ext] || '📄'
+}
+
+function guessContentType(filename: string): string {
+  const ext = (filename || '').split('.').pop()?.toLowerCase() || ''
+  const map: Record<string, string> = {
+    zip: 'application/zip', gz: 'application/gzip', tar: 'application/x-tar',
+    '7z': 'application/x-7z-compressed', rar: 'application/x-rar-compressed',
+    exe: 'application/octet-stream', dmg: 'application/x-apple-diskimage',
+    deb: 'application/vnd.debian.binary-package', rpm: 'application/x-rpm',
+    apk: 'application/vnd.android.package-archive',
+    pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', gif: 'image/gif',
+    svg: 'image/svg+xml', mp4: 'video/mp4', mp3: 'audio/mpeg',
+    txt: 'text/plain', md: 'text/markdown', json: 'application/json',
+  }
+  return map[ext] || 'application/octet-stream'
 }
 
 function escapeHtml(str: string): string {
